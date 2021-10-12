@@ -11,9 +11,11 @@
 #include "src/diagnostics/compilation-statistics.h"
 #include "src/execution/frames.h"
 #include "src/execution/v8threads.h"
+#include "src/handles/global-handles-inl.h"
 #include "src/logging/counters.h"
 #include "src/objects/heap-number.h"
 #include "src/objects/js-promise.h"
+#include "src/objects/managed-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/strings/string-hasher-inl.h"
 #include "src/utils/ostreams.h"
@@ -460,15 +462,22 @@ WasmEngine::~WasmEngine() {
 
 bool WasmEngine::SyncValidate(Isolate* isolate, const WasmFeatures& enabled,
                               const ModuleWireBytes& bytes) {
+  return SyncValidateResult(isolate, enabled, bytes).ok();
+}
+
+ModuleResult WasmEngine::SyncValidateResult(Isolate* isolate,
+                                            const WasmFeatures& enabled,
+                                            const ModuleWireBytes& bytes) {
   TRACE_EVENT0("v8.wasm", "wasm.SyncValidate");
   // TODO(titzer): remove dependency on the isolate.
-  if (bytes.start() == nullptr || bytes.length() == 0) return false;
-  ModuleResult result = DecodeWasmModule(
+  if (bytes.start() == nullptr || bytes.length() == 0) {
+    return ModuleResult(WasmError(0, "empty module wire bytes"));
+  }
+  return DecodeWasmModule(
       enabled, bytes.start(), bytes.end(), true, kWasmOrigin,
       isolate->counters(), isolate->metrics_recorder(),
       isolate->GetOrRegisterRecorderContextId(isolate->native_context()),
       DecodingMethod::kSync, allocator());
-  return result.ok();
 }
 
 MaybeHandle<AsmWasmData> WasmEngine::SyncCompileTranslatedAsmJs(
@@ -1034,10 +1043,10 @@ void WasmEngine::RemoveIsolate(Isolate* isolate) {
   for (auto* native_module : info->native_modules) {
     DCHECK_EQ(1, native_modules_.count(native_module));
     DCHECK_EQ(1, native_modules_[native_module]->isolates.count(isolate));
-    auto* info = native_modules_[native_module].get();
-    info->isolates.erase(isolate);
+    auto* module = native_modules_[native_module].get();
+    module->isolates.erase(isolate);
     if (current_gc_info_) {
-      for (WasmCode* code : info->potentially_dead_code) {
+      for (WasmCode* code : module->potentially_dead_code) {
         current_gc_info_->dead_code.erase(code);
       }
     }
@@ -1228,9 +1237,9 @@ void WasmEngine::StreamingCompilationFailed(size_t prefix_hash) {
 
 void WasmEngine::FreeNativeModule(NativeModule* native_module) {
   base::MutexGuard guard(&mutex_);
-  auto it = native_modules_.find(native_module);
-  DCHECK_NE(native_modules_.end(), it);
-  for (Isolate* isolate : it->second->isolates) {
+  auto module = native_modules_.find(native_module);
+  DCHECK_NE(native_modules_.end(), module);
+  for (Isolate* isolate : module->second->isolates) {
     DCHECK_EQ(1, isolates_.count(isolate));
     IsolateInfo* info = isolates_[isolate].get();
     DCHECK_EQ(1, info->native_modules.count(native_module));
@@ -1274,7 +1283,7 @@ void WasmEngine::FreeNativeModule(NativeModule* native_module) {
                   native_module, current_gc_info_->dead_code.size());
   }
   native_module_cache_.Erase(native_module);
-  native_modules_.erase(it);
+  native_modules_.erase(module);
 }
 
 namespace {

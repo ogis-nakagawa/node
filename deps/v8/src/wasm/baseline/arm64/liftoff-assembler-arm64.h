@@ -57,9 +57,10 @@ inline constexpr Condition ToCondition(LiftoffCondition liftoff_cond) {
 //  -----+--------------------+  <-- frame ptr (fp)
 //  -1   | 0xa: WASM          |
 //  -2   |     instance       |
+//  -3   |     feedback vector|
 //  -----+--------------------+---------------------------
-//  -3   |     slot 0         |   ^
-//  -4   |     slot 1         |   |
+//  -4   |     slot 0         |   ^
+//  -5   |     slot 1         |   |
 //       |                    | Frame slots
 //       |                    |   |
 //       |                    |   v
@@ -68,6 +69,7 @@ inline constexpr Condition ToCondition(LiftoffCondition liftoff_cond) {
 //
 
 constexpr int kInstanceOffset = 2 * kSystemPointerSize;
+constexpr int kFeedbackVectorOffset = 3 * kSystemPointerSize;
 
 inline MemOperand GetStackSlot(int offset) { return MemOperand(fp, -offset); }
 
@@ -384,7 +386,7 @@ void LiftoffAssembler::AbortCompilation() { AbortedCodeGeneration(); }
 
 // static
 constexpr int LiftoffAssembler::StaticStackFrameSize() {
-  return liftoff::kInstanceOffset;
+  return liftoff::kFeedbackVectorOffset;
 }
 
 int LiftoffAssembler::SlotSizeForType(ValueKind kind) {
@@ -450,6 +452,13 @@ void LiftoffAssembler::LoadTaggedPointerFromInstance(Register dst,
                                                      int offset) {
   DCHECK_LE(0, offset);
   LoadTaggedPointerField(dst, MemOperand{instance, offset});
+}
+
+void LiftoffAssembler::LoadExternalPointer(Register dst, Register instance,
+                                           int offset, ExternalPointerTag tag,
+                                           Register isolate_root) {
+  LoadExternalPointerField(dst, FieldMemOperand(instance, offset), tag,
+                           isolate_root);
 }
 
 void LiftoffAssembler::SpillInstance(Register instance) {

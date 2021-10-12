@@ -523,6 +523,8 @@ Handle<SeqOneByteString> FactoryBase<Impl>::NewOneByteInternalizedString(
     const base::Vector<const uint8_t>& str, uint32_t raw_hash_field) {
   Handle<SeqOneByteString> result =
       AllocateRawOneByteInternalizedString(str.length(), raw_hash_field);
+  // No synchronization is needed since the shared string hasn't yet escaped to
+  // script.
   DisallowGarbageCollection no_gc;
   MemCopy(result->GetChars(no_gc, SharedStringAccessGuardIfNeeded::NotNeeded()),
           str.begin(), str.length());
@@ -534,6 +536,8 @@ Handle<SeqTwoByteString> FactoryBase<Impl>::NewTwoByteInternalizedString(
     const base::Vector<const base::uc16>& str, uint32_t raw_hash_field) {
   Handle<SeqTwoByteString> result =
       AllocateRawTwoByteInternalizedString(str.length(), raw_hash_field);
+  // No synchronization is needed since the shared string hasn't yet escaped to
+  // script.
   DisallowGarbageCollection no_gc;
   MemCopy(result->GetChars(no_gc, SharedStringAccessGuardIfNeeded::NotNeeded()),
           str.begin(), str.length() * base::kUC16Size);
@@ -550,8 +554,10 @@ MaybeHandle<SeqOneByteString> FactoryBase<Impl>::NewRawOneByteString(
   int size = SeqOneByteString::SizeFor(length);
   DCHECK_GE(SeqOneByteString::kMaxSize, size);
 
+  Map map = read_only_roots().one_byte_string_map();
   SeqOneByteString string = SeqOneByteString::cast(AllocateRawWithImmortalMap(
-      size, allocation, read_only_roots().one_byte_string_map()));
+      size, RefineAllocationTypeForInPlaceInternalizableString(allocation, map),
+      map));
   DisallowGarbageCollection no_gc;
   string.set_length(length);
   string.set_raw_hash_field(String::kEmptyHashField);
@@ -569,8 +575,10 @@ MaybeHandle<SeqTwoByteString> FactoryBase<Impl>::NewRawTwoByteString(
   int size = SeqTwoByteString::SizeFor(length);
   DCHECK_GE(SeqTwoByteString::kMaxSize, size);
 
+  Map map = read_only_roots().string_map();
   SeqTwoByteString string = SeqTwoByteString::cast(AllocateRawWithImmortalMap(
-      size, allocation, read_only_roots().string_map()));
+      size, RefineAllocationTypeForInPlaceInternalizableString(allocation, map),
+      map));
   DisallowGarbageCollection no_gc;
   string.set_length(length);
   string.set_raw_hash_field(String::kEmptyHashField);
@@ -627,13 +635,13 @@ MaybeHandle<String> FactoryBase<Impl>::NewConsString(
       // Copy left part.
       {
         const uint8_t* src =
-            left->template GetChars<uint8_t>(no_gc, access_guard);
+            left->template GetChars<uint8_t>(isolate(), no_gc, access_guard);
         CopyChars(dest, src, left_length);
       }
       // Copy right part.
       {
         const uint8_t* src =
-            right->template GetChars<uint8_t>(no_gc, access_guard);
+            right->template GetChars<uint8_t>(isolate(), no_gc, access_guard);
         CopyChars(dest + left_length, src, right_length);
       }
       return result;
@@ -645,9 +653,10 @@ MaybeHandle<String> FactoryBase<Impl>::NewConsString(
     DisallowGarbageCollection no_gc;
     SharedStringAccessGuardIfNeeded access_guard(isolate());
     base::uc16* sink = result->GetChars(no_gc, access_guard);
-    String::WriteToFlat(*left, sink, 0, left->length(), access_guard);
-    String::WriteToFlat(*right, sink + left->length(), 0, right->length(),
+    String::WriteToFlat(*left, sink, 0, left->length(), isolate(),
                         access_guard);
+    String::WriteToFlat(*right, sink + left->length(), 0, right->length(),
+                        isolate(), access_guard);
     return result;
   }
 
@@ -772,8 +781,10 @@ FactoryBase<Impl>::AllocateRawOneByteInternalizedString(
   int size = SeqOneByteString::SizeFor(length);
   HeapObject result = AllocateRawWithImmortalMap(
       size,
-      impl()->CanAllocateInReadOnlySpace() ? AllocationType::kReadOnly
-                                           : AllocationType::kOld,
+      RefineAllocationTypeForInPlaceInternalizableString(
+          impl()->CanAllocateInReadOnlySpace() ? AllocationType::kReadOnly
+                                               : AllocationType::kOld,
+          map),
       map);
   SeqOneByteString answer = SeqOneByteString::cast(result);
   DisallowGarbageCollection no_gc;
@@ -792,8 +803,11 @@ FactoryBase<Impl>::AllocateRawTwoByteInternalizedString(
 
   Map map = read_only_roots().internalized_string_map();
   int size = SeqTwoByteString::SizeFor(length);
-  SeqTwoByteString answer = SeqTwoByteString::cast(
-      AllocateRawWithImmortalMap(size, AllocationType::kOld, map));
+  SeqTwoByteString answer = SeqTwoByteString::cast(AllocateRawWithImmortalMap(
+      size,
+      RefineAllocationTypeForInPlaceInternalizableString(AllocationType::kOld,
+                                                         map),
+      map));
   DisallowGarbageCollection no_gc;
   answer.set_length(length);
   answer.set_raw_hash_field(raw_hash_field);
@@ -908,6 +922,45 @@ FactoryBase<Impl>::NewFunctionTemplateRareData() {
   function_template_rare_data.set_c_function_overloads(
       *impl()->empty_fixed_array(), SKIP_WRITE_BARRIER);
   return handle(function_template_rare_data, isolate());
+}
+
+template <typename Impl>
+MaybeHandle<Map> FactoryBase<Impl>::GetInPlaceInternalizedStringMap(
+    Map from_string_map) {
+  InstanceType instance_type = from_string_map.instance_type();
+  MaybeHandle<Map> map;
+  switch (instance_type) {
+    case STRING_TYPE:
+      map = read_only_roots().internalized_string_map_handle();
+      break;
+    case ONE_BYTE_STRING_TYPE:
+      map = read_only_roots().one_byte_internalized_string_map_handle();
+      break;
+    case EXTERNAL_STRING_TYPE:
+      map = read_only_roots().external_internalized_string_map_handle();
+      break;
+    case EXTERNAL_ONE_BYTE_STRING_TYPE:
+      map =
+          read_only_roots().external_one_byte_internalized_string_map_handle();
+      break;
+    default:
+      break;
+  }
+  DCHECK_EQ(!map.is_null(), String::IsInPlaceInternalizable(instance_type));
+  return map;
+}
+
+template <typename Impl>
+AllocationType
+FactoryBase<Impl>::RefineAllocationTypeForInPlaceInternalizableString(
+    AllocationType allocation, Map string_map) {
+#ifdef DEBUG
+  InstanceType instance_type = string_map.instance_type();
+  DCHECK(InstanceTypeChecker::IsInternalizedString(instance_type) ||
+         String::IsInPlaceInternalizable(instance_type));
+#endif
+  if (allocation != AllocationType::kOld) return allocation;
+  return impl()->AllocationTypeForInPlaceInternalizableString();
 }
 
 // Instantiate FactoryBase for the two variants we want.

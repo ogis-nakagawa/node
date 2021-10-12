@@ -245,9 +245,9 @@ void CodeAssembler::GenerateCheckMaybeObjectIsObject(TNode<MaybeObject> node,
   base::EmbeddedVector<char, 1024> message;
   SNPrintF(message, "no Object: %s", location);
   TNode<String> message_node = StringConstant(message.begin());
-  // This somewhat misuses the AbortCSAAssert runtime function. This will print
-  // "abort: CSA_ASSERT failed: <message>", which is good enough.
-  AbortCSAAssert(message_node);
+  // This somewhat misuses the AbortCSADcheck runtime function. This will print
+  // "abort: CSA_DCHECK failed: <message>", which is good enough.
+  AbortCSADcheck(message_node);
   Unreachable();
   Bind(&ok);
 }
@@ -490,6 +490,15 @@ void CodeAssembler::Return(TNode<WordT> value1, TNode<WordT> value2) {
   return raw_assembler()->Return(value1, value2);
 }
 
+void CodeAssembler::Return(TNode<WordT> value1, TNode<Object> value2) {
+  DCHECK_EQ(2, raw_assembler()->call_descriptor()->ReturnCount());
+  DCHECK_EQ(
+      MachineType::PointerRepresentation(),
+      raw_assembler()->call_descriptor()->GetReturnType(0).representation());
+  DCHECK(raw_assembler()->call_descriptor()->GetReturnType(1).IsTagged());
+  return raw_assembler()->Return(value1, value2);
+}
+
 void CodeAssembler::PopAndReturn(Node* pop, Node* value) {
   DCHECK_EQ(1, raw_assembler()->call_descriptor()->ReturnCount());
   return raw_assembler()->PopAndReturn(pop, value);
@@ -503,8 +512,8 @@ void CodeAssembler::ReturnIf(TNode<BoolT> condition, TNode<Object> value) {
   Bind(&if_continue);
 }
 
-void CodeAssembler::AbortCSAAssert(Node* message) {
-  raw_assembler()->AbortCSAAssert(message);
+void CodeAssembler::AbortCSADcheck(Node* message) {
+  raw_assembler()->AbortCSADcheck(message);
 }
 
 void CodeAssembler::DebugBreak() { raw_assembler()->DebugBreak(); }

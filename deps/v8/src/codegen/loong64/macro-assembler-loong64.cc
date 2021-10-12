@@ -1258,18 +1258,6 @@ void TurboAssembler::li(Register rd, Operand j, LiFlags mode) {
   BlockTrampolinePoolScope block_trampoline_pool(this);
   if (!MustUseReg(j.rmode()) && mode == OPTIMIZE_SIZE) {
     li_optimized(rd, j, mode);
-  } else if (IsOnHeap() && RelocInfo::IsEmbeddedObjectMode(j.rmode())) {
-    BlockGrowBufferScope block_growbuffer(this);
-    int offset = pc_offset();
-    Address address = j.immediate();
-    saved_handles_for_raw_object_ptr_.push_back(
-        std::make_pair(offset, address));
-    Handle<HeapObject> object(reinterpret_cast<Address*>(address));
-    int64_t immediate = object->ptr();
-    RecordRelocInfo(j.rmode(), immediate);
-    lu12i_w(rd, immediate >> 12 & 0xfffff);
-    ori(rd, rd, immediate & kImm12Mask);
-    lu32i_d(rd, immediate >> 32 & 0xfffff);
   } else if (MustUseReg(j.rmode())) {
     int64_t immediate;
     if (j.IsHeapObjectRequest()) {
@@ -2768,7 +2756,7 @@ void TurboAssembler::LoadEntryFromBuiltin(Builtin builtin,
 MemOperand TurboAssembler::EntryFromBuiltinAsOperand(Builtin builtin) {
   DCHECK(root_array_available());
   return MemOperand(kRootRegister,
-                    IsolateData::builtin_entry_slot_offset(builtin));
+                    IsolateData::BuiltinEntrySlotOffset(builtin));
 }
 
 void TurboAssembler::CallBuiltinByIndex(Register builtin_index) {
@@ -3030,8 +3018,8 @@ void MacroAssembler::InvokePrologue(Register expected_parameter_count,
 
   bind(&stack_overflow);
   {
-    FrameScope frame(this,
-                     has_frame() ? StackFrame::NONE : StackFrame::INTERNAL);
+    FrameScope frame(
+        this, has_frame() ? StackFrame::NO_FRAME_TYPE : StackFrame::INTERNAL);
     CallRuntime(Runtime::kThrowStackOverflow);
     break_(0xCC);
   }
@@ -3044,7 +3032,8 @@ void MacroAssembler::CallDebugOnFunctionCall(Register fun, Register new_target,
                                              Register actual_parameter_count) {
   // Load receiver to pass it later to DebugOnFunctionCall hook.
   LoadReceiver(t0, actual_parameter_count);
-  FrameScope frame(this, has_frame() ? StackFrame::NONE : StackFrame::INTERNAL);
+  FrameScope frame(
+      this, has_frame() ? StackFrame::NO_FRAME_TYPE : StackFrame::INTERNAL);
 
   SmiTag(expected_parameter_count);
   Push(expected_parameter_count);
@@ -3392,7 +3381,7 @@ void TurboAssembler::Abort(AbortReason reason) {
 
   if (should_abort_hard()) {
     // We don't care if we constructed a frame. Just pretend we did.
-    FrameScope assume_frame(this, StackFrame::NONE);
+    FrameScope assume_frame(this, StackFrame::NO_FRAME_TYPE);
     PrepareCallCFunction(0, a0);
     li(a0, Operand(static_cast<int>(reason)));
     CallCFunction(ExternalReference::abort_with_reason(), 1);
@@ -3405,7 +3394,7 @@ void TurboAssembler::Abort(AbortReason reason) {
   if (!has_frame()) {
     // We don't actually want to generate a pile of code for this, so just
     // claim there is a stack frame, without generating one.
-    FrameScope scope(this, StackFrame::NONE);
+    FrameScope scope(this, StackFrame::NO_FRAME_TYPE);
     Call(BUILTIN_CODE(isolate(), Abort), RelocInfo::CODE_TARGET);
   } else {
     Call(BUILTIN_CODE(isolate(), Abort), RelocInfo::CODE_TARGET);
@@ -3659,7 +3648,7 @@ void MacroAssembler::JumpIfNotSmi(Register value, Label* not_smi_label) {
   Branch(not_smi_label, ne, scratch, Operand(zero_reg));
 }
 
-void MacroAssembler::AssertNotSmi(Register object) {
+void TurboAssembler::AssertNotSmi(Register object) {
   if (FLAG_debug_code) {
     STATIC_ASSERT(kSmiTag == 0);
     UseScratchRegisterScope temps(this);
@@ -3669,7 +3658,7 @@ void MacroAssembler::AssertNotSmi(Register object) {
   }
 }
 
-void MacroAssembler::AssertSmi(Register object) {
+void TurboAssembler::AssertSmi(Register object) {
   if (FLAG_debug_code) {
     STATIC_ASSERT(kSmiTag == 0);
     UseScratchRegisterScope temps(this);
@@ -4030,8 +4019,8 @@ void TurboAssembler::CallForDeoptimization(Builtin target, int, Label* exit,
                                            DeoptimizeKind kind, Label* ret,
                                            Label*) {
   BlockTrampolinePoolScope block_trampoline_pool(this);
-  Ld_d(t7, MemOperand(kRootRegister,
-                      IsolateData::builtin_entry_slot_offset(target)));
+  Ld_d(t7,
+       MemOperand(kRootRegister, IsolateData::BuiltinEntrySlotOffset(target)));
   Call(t7);
   DCHECK_EQ(SizeOfCodeGeneratedSince(exit),
             (kind == DeoptimizeKind::kLazy)

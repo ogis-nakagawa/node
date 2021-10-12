@@ -132,15 +132,8 @@ MaybeHandle<Code> Factory::CodeBuilder::BuildInternal(
   CodePageCollectionMemoryModificationScope code_allocation(heap);
 
   Handle<Code> code;
-  bool code_is_on_heap = code_desc_.origin && code_desc_.origin->IsOnHeap();
-  if (code_is_on_heap) {
-    DCHECK(FLAG_sparkplug_on_heap);
-    DCHECK_EQ(kind_, CodeKind::BASELINE);
-    code = code_desc_.origin->code().ToHandleChecked();
-  } else {
-    if (!AllocateCode(retry_allocation_or_fail).ToHandle(&code)) {
-      return MaybeHandle<Code>();
-    }
+  if (!AllocateCode(retry_allocation_or_fail).ToHandle(&code)) {
+    return MaybeHandle<Code>();
   }
 
   {
@@ -148,12 +141,9 @@ MaybeHandle<Code> Factory::CodeBuilder::BuildInternal(
     constexpr bool kIsNotOffHeapTrampoline = false;
     DisallowGarbageCollection no_gc;
 
-    if (code_is_on_heap) {
-      heap->NotifyCodeObjectChangeStart(raw_code, no_gc);
-    }
-
     raw_code.set_raw_instruction_size(code_desc_.instruction_size());
     raw_code.set_raw_metadata_size(code_desc_.metadata_size());
+    raw_code.set_relocation_info(*reloc_info);
     raw_code.initialize_flags(kind_, is_turbofanned_, stack_slots_,
                               kIsNotOffHeapTrampoline);
     raw_code.set_builtin_id(builtin_);
@@ -201,30 +191,18 @@ MaybeHandle<Code> Factory::CodeBuilder::BuildInternal(
               handle(on_heap_profiler_data->counts(), isolate_));
     }
 
-    if (code_is_on_heap) {
-      FinalizeOnHeapCode(code, *reloc_info);
-    } else {
-      // Migrate generated code.
-      // The generated code can contain embedded objects (typically from
-      // handles) in a pointer-to-tagged-value format (i.e. with indirection
-      // like a handle) that are dereferenced during the copy to point directly
-      // to the actual heap objects. These pointers can include references to
-      // the code object itself, through the self_reference parameter.
-      raw_code.CopyFromNoFlush(*reloc_info, heap, code_desc_);
-    }
+    // Migrate generated code.
+    // The generated code can contain embedded objects (typically from
+    // handles) in a pointer-to-tagged-value format (i.e. with indirection
+    // like a handle) that are dereferenced during the copy to point directly
+    // to the actual heap objects. These pointers can include references to
+    // the code object itself, through the self_reference parameter.
+    raw_code.CopyFromNoFlush(*reloc_info, heap, code_desc_);
 
     raw_code.clear_padding();
 
-    if (code_is_on_heap) {
-      raw_code.set_relocation_info(*reloc_info, kReleaseStore);
-      // Now that object is properly initialized, the GC needs to revisit this
-      // object if marking is on.
-      heap->NotifyCodeObjectChangeEnd(raw_code, no_gc);
-    } else {
-      raw_code.set_relocation_info(*reloc_info);
-    }
-
     if (V8_EXTERNAL_CODE_SPACE_BOOL) {
+      raw_code.set_main_cage_base(isolate_->cage_base());
       data_container->SetCodeAndEntryPoint(isolate_, raw_code);
     }
 #ifdef VERIFY_HEAP
@@ -287,73 +265,6 @@ MaybeHandle<Code> Factory::CodeBuilder::AllocateCode(
         !V8_ENABLE_THIRD_PARTY_HEAP_BOOL && !heap->code_region().is_empty(),
         heap->code_region().contains(code->address()));
   }
-  return code;
-}
-
-void Factory::CodeBuilder::FinalizeOnHeapCode(Handle<Code> code,
-                                              ByteArray reloc_info) {
-  Heap* heap = isolate_->heap();
-
-  // We cannot trim the Code object in CODE_LO_SPACE.
-  DCHECK(!heap->code_lo_space()->Contains(*code));
-
-  code->CopyRelocInfoToByteArray(reloc_info, code_desc_);
-
-  if (code_desc_.origin->OnHeapGCCount() != heap->gc_count()) {
-    // If a GC happens between Code object allocation and now, we might have
-    // invalid embedded object references.
-    code_desc_.origin->FixOnHeapReferences();
-  }
-
-#ifdef VERIFY_HEAP
-  code->VerifyRelocInfo(isolate_, reloc_info);
-#endif
-
-  int old_object_size = Code::SizeFor(code_desc_.origin->buffer_size());
-  int new_object_size =
-      Code::SizeFor(code_desc_.instruction_size() + code_desc_.metadata_size());
-  int size_to_trim = old_object_size - new_object_size;
-  DCHECK_GE(size_to_trim, 0);
-  heap->CreateFillerObjectAt(code->address() + new_object_size, size_to_trim,
-                             ClearRecordedSlots::kNo);
-}
-
-MaybeHandle<Code> Factory::NewEmptyCode(CodeKind kind, int buffer_size) {
-  STATIC_ASSERT(Code::kOnHeapBodyIsContiguous);
-  const int object_size = Code::SizeFor(buffer_size);
-  Heap* heap = isolate()->heap();
-
-  HeapObject result = heap->AllocateRawWith<Heap::kLightRetry>(
-      object_size, AllocationType::kCode, AllocationOrigin::kRuntime);
-  if (result.is_null()) return MaybeHandle<Code>();
-
-  DisallowGarbageCollection no_gc;
-  result.set_map_after_allocation(*code_map(), SKIP_WRITE_BARRIER);
-
-  Code raw_code = Code::cast(result);
-  constexpr bool kIsNotOffHeapTrampoline = false;
-  raw_code.set_raw_instruction_size(0);
-  raw_code.set_raw_metadata_size(buffer_size);
-  raw_code.set_relocation_info_or_undefined(*undefined_value());
-  raw_code.initialize_flags(kind, false, 0, kIsNotOffHeapTrampoline);
-  raw_code.set_builtin_id(Builtin::kNoBuiltinId);
-  auto code_data_container =
-      Handle<CodeDataContainer>::cast(trampoline_trivial_code_data_container());
-  raw_code.set_code_data_container(*code_data_container, kReleaseStore);
-  raw_code.set_deoptimization_data(*DeoptimizationData::Empty(isolate()));
-  raw_code.set_bytecode_offset_table(*empty_byte_array());
-  raw_code.set_handler_table_offset(0);
-  raw_code.set_constant_pool_offset(0);
-  raw_code.set_code_comments_offset(0);
-  raw_code.set_unwinding_info_offset(0);
-
-  Handle<Code> code = handle(raw_code, isolate());
-  DCHECK(IsAligned(code->address(), kCodeAlignment));
-  DCHECK_IMPLIES(
-      !V8_ENABLE_THIRD_PARTY_HEAP_BOOL && !heap->code_region().is_empty(),
-      heap->code_region().contains(code->address()));
-
-  DCHECK(heap->code_space()->Contains(raw_code));
   return code;
 }
 
@@ -883,12 +794,14 @@ Handle<String> Factory::AllocateInternalizedStringImpl(T t, int chars,
     size = SeqTwoByteString::SizeFor(chars);
   }
 
-  String result = String::cast(
-      AllocateRawWithImmortalMap(size,
-                                 isolate()->heap()->CanAllocateInReadOnlySpace()
-                                     ? AllocationType::kReadOnly
-                                     : AllocationType::kOld,
-                                 map));
+  String result = String::cast(AllocateRawWithImmortalMap(
+      size,
+      RefineAllocationTypeForInPlaceInternalizableString(
+          isolate()->heap()->CanAllocateInReadOnlySpace()
+              ? AllocationType::kReadOnly
+              : AllocationType::kOld,
+          map),
+      map));
   DisallowGarbageCollection no_gc;
   result.set_length(chars);
   result.set_raw_hash_field(hash_field);
@@ -913,34 +826,35 @@ Handle<String> Factory::NewInternalizedStringImpl(Handle<String> string,
 
 namespace {
 
-MaybeHandle<Map> GetInternalizedStringMap(Factory* f, Handle<String> string) {
-  switch (string->map().instance_type()) {
-    case STRING_TYPE:
-      return f->internalized_string_map();
-    case ONE_BYTE_STRING_TYPE:
-      return f->one_byte_internalized_string_map();
-    case EXTERNAL_STRING_TYPE:
-      return f->external_internalized_string_map();
-    case EXTERNAL_ONE_BYTE_STRING_TYPE:
-      return f->external_one_byte_internalized_string_map();
-    default:
-      return MaybeHandle<Map>();  // No match found.
-  }
-}
-
 }  // namespace
 
-MaybeHandle<Map> Factory::InternalizedStringMapForString(
-    Handle<String> string) {
-  // Do not internalize young strings: This allows us to ignore both string
-  // table and stub cache on scavenges.
-  if (Heap::InYoungGeneration(*string)) return MaybeHandle<Map>();
-  return GetInternalizedStringMap(this, string);
+StringInternalizationStrategy Factory::ComputeInternalizationStrategyForString(
+    Handle<String> string, MaybeHandle<Map>* internalized_map) {
+  // Do not internalize young strings in-place: This allows us to ignore both
+  // string table and stub cache on scavenges.
+  if (Heap::InYoungGeneration(*string)) {
+    return StringInternalizationStrategy::kCopy;
+  }
+  DCHECK_NOT_NULL(internalized_map);
+  DisallowGarbageCollection no_gc;
+  // This method may be called concurrently, so snapshot the map from the input
+  // string instead of the calling IsType methods on HeapObject, which would
+  // reload the map each time.
+  Map map = string->map();
+  *internalized_map = GetInPlaceInternalizedStringMap(map);
+  if (!internalized_map->is_null()) {
+    return StringInternalizationStrategy::kInPlace;
+  }
+  if (InstanceTypeChecker::IsInternalizedString(map.instance_type())) {
+    return StringInternalizationStrategy::kAlreadyInternalized;
+  }
+  return StringInternalizationStrategy::kCopy;
 }
 
 template <class StringClass>
 Handle<StringClass> Factory::InternalizeExternalString(Handle<String> string) {
-  Handle<Map> map = GetInternalizedStringMap(this, string).ToHandleChecked();
+  Handle<Map> map =
+      GetInPlaceInternalizedStringMap(string->map()).ToHandleChecked();
   StringClass external_string =
       StringClass::cast(New(map, AllocationType::kOld));
   DisallowGarbageCollection no_gc;
@@ -1021,14 +935,14 @@ Handle<String> Factory::NewProperSubString(Handle<String> str, int begin,
           NewRawOneByteString(length).ToHandleChecked();
       DisallowGarbageCollection no_gc;
       uint8_t* dest = result->GetChars(no_gc);
-      String::WriteToFlat(*str, dest, begin, end);
+      String::WriteToFlat(*str, dest, begin, length);
       return result;
     } else {
       Handle<SeqTwoByteString> result =
           NewRawTwoByteString(length).ToHandleChecked();
       DisallowGarbageCollection no_gc;
       base::uc16* dest = result->GetChars(no_gc);
-      String::WriteToFlat(*str, dest, begin, end);
+      String::WriteToFlat(*str, dest, begin, length);
       return result;
     }
   }
@@ -1572,14 +1486,17 @@ Handle<WasmArray> Factory::NewWasmArray(
   WasmArray result = WasmArray::cast(raw);
   result.set_raw_properties_or_hash(*empty_fixed_array(), kRelaxedStore);
   result.set_length(length);
-  for (uint32_t i = 0; i < length; i++) {
-    Address address = result.ElementAddress(i);
-    if (type->element_type().is_numeric()) {
+  if (type->element_type().is_numeric()) {
+    for (uint32_t i = 0; i < length; i++) {
+      Address address = result.ElementAddress(i);
       elements[i]
           .Packed(type->element_type())
           .CopyTo(reinterpret_cast<byte*>(address));
-    } else {
-      base::WriteUnalignedValue<Object>(address, *elements[i].to_ref());
+    }
+  } else {
+    for (uint32_t i = 0; i < length; i++) {
+      int offset = result.element_offset(i);
+      TaggedField<Object>::store(result, offset, *elements[i].to_ref());
     }
   }
   return handle(result, isolate());
@@ -1594,11 +1511,13 @@ Handle<WasmStruct> Factory::NewWasmStruct(const wasm::StructType* type,
   WasmStruct result = WasmStruct::cast(raw);
   result.set_raw_properties_or_hash(*empty_fixed_array(), kRelaxedStore);
   for (uint32_t i = 0; i < type->field_count(); i++) {
-    Address address = result.RawFieldAddress(type->field_offset(i));
+    int offset = type->field_offset(i);
     if (type->field(i).is_numeric()) {
+      Address address = result.RawFieldAddress(offset);
       args[i].Packed(type->field(i)).CopyTo(reinterpret_cast<byte*>(address));
     } else {
-      base::WriteUnalignedValue<Object>(address, *args[i].to_ref());
+      offset += WasmStruct::kHeaderSize;
+      TaggedField<Object>::store(result, offset, *args[i].to_ref());
     }
   }
   return handle(result, isolate());
@@ -2173,6 +2092,7 @@ Handle<CodeDataContainer> Factory::NewCodeDataContainer(
   data_container.set_kind_specific_flags(flags, kRelaxedStore);
   if (V8_EXTERNAL_CODE_SPACE_BOOL) {
     data_container.AllocateExternalPointerEntries(isolate());
+    data_container.set_code_cage_base(isolate()->code_cage_base());
     data_container.set_raw_code(Smi::zero(), SKIP_WRITE_BARRIER);
     data_container.set_code_entry_point(isolate(), kNullAddress);
   }
@@ -3654,7 +3574,8 @@ Handle<Map> Factory::CreateStrictFunctionMap(
 }
 
 Handle<Map> Factory::CreateClassFunctionMap(Handle<JSFunction> empty_function) {
-  Handle<Map> map = NewMap(JS_FUNCTION_TYPE, JSFunction::kSizeWithPrototype);
+  Handle<Map> map =
+      NewMap(JS_CLASS_CONSTRUCTOR_TYPE, JSFunction::kSizeWithPrototype);
   {
     DisallowGarbageCollection no_gc;
     Map raw_map = *map;
@@ -3730,6 +3651,12 @@ bool Factory::CanAllocateInReadOnlySpace() {
 
 bool Factory::EmptyStringRootIsInitialized() {
   return isolate()->roots_table()[RootIndex::kempty_string] != kNullAddress;
+}
+
+AllocationType Factory::AllocationTypeForInPlaceInternalizableString() {
+  return isolate()
+      ->heap()
+      ->allocation_type_for_in_place_internalizable_strings();
 }
 
 Handle<JSFunction> Factory::NewFunctionForTesting(Handle<String> name) {

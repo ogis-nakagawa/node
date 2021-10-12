@@ -11,6 +11,7 @@
 #include "include/v8-primitive.h"
 #include "src/base/strings.h"
 #include "src/common/globals.h"
+#include "src/execution/isolate-utils.h"
 #include "src/handles/handles.h"
 #include "src/logging/runtime-call-stats-scope.h"
 #include "src/objects/objects-inl.h"
@@ -102,7 +103,7 @@ class ExternalStringStream {
   ExternalStringStream(ExternalString string, size_t start_offset,
                        size_t length)
       : lock_(string),
-        data_(string.GetChars() + start_offset),
+        data_(string.GetChars(GetPtrComprCageBase(string)) + start_offset),
         length_(length) {}
 
   ExternalStringStream(const ExternalStringStream& other) V8_NOEXCEPT
@@ -251,8 +252,7 @@ class BufferedCharacterStream : public Utf16CharacterStream {
   }
 
  protected:
-  bool ReadBlock() final {
-    size_t position = pos();
+  bool ReadBlock(size_t position) final {
     buffer_pos_ = position;
     buffer_start_ = &buffer_[0];
     buffer_cursor_ = buffer_start_;
@@ -308,8 +308,7 @@ class UnbufferedCharacterStream : public Utf16CharacterStream {
   }
 
  protected:
-  bool ReadBlock() final {
-    size_t position = pos();
+  bool ReadBlock(size_t position) final {
     buffer_pos_ = position;
     DisallowGarbageCollection no_gc;
     Range<uint16_t> range =
@@ -386,7 +385,7 @@ class BufferedUtf16CharacterStream : public Utf16CharacterStream {
  protected:
   static const size_t kBufferSize = 512;
 
-  bool ReadBlock() final;
+  bool ReadBlock(size_t position) final;
 
   // FillBuffer should read up to kBufferSize characters at position and store
   // them into buffer_[0..]. It returns the number of characters stored.
@@ -400,10 +399,9 @@ class BufferedUtf16CharacterStream : public Utf16CharacterStream {
 BufferedUtf16CharacterStream::BufferedUtf16CharacterStream()
     : Utf16CharacterStream(buffer_, buffer_, buffer_, 0) {}
 
-bool BufferedUtf16CharacterStream::ReadBlock() {
+bool BufferedUtf16CharacterStream::ReadBlock(size_t position) {
   DCHECK_EQ(buffer_start_, buffer_);
 
-  size_t position = pos();
   buffer_pos_ = position;
   buffer_cursor_ = buffer_;
   buffer_end_ = buffer_ + FillBuffer(position);
@@ -476,8 +474,7 @@ class Windows1252CharacterStream final : public Utf16CharacterStream {
   }
 
  protected:
-  bool ReadBlock() final {
-    size_t position = pos();
+  bool ReadBlock(size_t position) final {
     buffer_pos_ = position;
     buffer_start_ = &buffer_[0];
     buffer_cursor_ = buffer_start_;

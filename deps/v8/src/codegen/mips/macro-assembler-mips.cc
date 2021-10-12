@@ -1394,17 +1394,6 @@ void TurboAssembler::li(Register rd, Operand j, LiFlags mode) {
         ori(rd, rd, (j.immediate() & kImm16Mask));
       }
     }
-  } else if (IsOnHeap() && RelocInfo::IsEmbeddedObjectMode(j.rmode())) {
-    BlockGrowBufferScope block_growbuffer(this);
-    int offset = pc_offset();
-    Address address = j.immediate();
-    saved_handles_for_raw_object_ptr_.emplace_back(offset, address);
-    Handle<HeapObject> object(reinterpret_cast<Address*>(address));
-    int32_t immediate = object->ptr();
-    RecordRelocInfo(j.rmode(), immediate);
-    lui(rd, (immediate >> kLuiShift) & kImm16Mask);
-    ori(rd, rd, (immediate & kImm16Mask));
-    DCHECK(EmbeddedObjectMatches(offset, object));
   } else {
     int32_t immediate;
     if (j.IsHeapObjectRequest()) {
@@ -3975,7 +3964,7 @@ void TurboAssembler::LoadEntryFromBuiltin(Builtin builtin,
 MemOperand TurboAssembler::EntryFromBuiltinAsOperand(Builtin builtin) {
   DCHECK(root_array_available());
   return MemOperand(kRootRegister,
-                    IsolateData::builtin_entry_slot_offset(builtin));
+                    IsolateData::BuiltinEntrySlotOffset(builtin));
 }
 
 void TurboAssembler::CallBuiltinByIndex(Register builtin_index) {
@@ -4397,8 +4386,8 @@ void MacroAssembler::InvokePrologue(Register expected_parameter_count,
 
   bind(&stack_overflow);
   {
-    FrameScope frame(this,
-                     has_frame() ? StackFrame::NONE : StackFrame::INTERNAL);
+    FrameScope frame(
+        this, has_frame() ? StackFrame::NO_FRAME_TYPE : StackFrame::INTERNAL);
     CallRuntime(Runtime::kThrowStackOverflow);
     break_(0xCC);
   }
@@ -4418,8 +4407,8 @@ void MacroAssembler::CheckDebugHook(Register fun, Register new_target,
     // Load receiver to pass it later to DebugOnFunctionCall hook.
     LoadReceiver(t0, actual_parameter_count);
 
-    FrameScope frame(this,
-                     has_frame() ? StackFrame::NONE : StackFrame::INTERNAL);
+    FrameScope frame(
+        this, has_frame() ? StackFrame::NO_FRAME_TYPE : StackFrame::INTERNAL);
     SmiTag(expected_parameter_count);
     Push(expected_parameter_count);
 
@@ -4745,7 +4734,7 @@ void TurboAssembler::Abort(AbortReason reason) {
 
   if (should_abort_hard()) {
     // We don't care if we constructed a frame. Just pretend we did.
-    FrameScope assume_frame(this, StackFrame::NONE);
+    FrameScope assume_frame(this, StackFrame::NO_FRAME_TYPE);
     PrepareCallCFunction(0, a0);
     li(a0, Operand(static_cast<int>(reason)));
     CallCFunction(ExternalReference::abort_with_reason(), 1);
@@ -4758,7 +4747,7 @@ void TurboAssembler::Abort(AbortReason reason) {
   if (!has_frame_) {
     // We don't actually want to generate a pile of code for this, so just
     // claim there is a stack frame, without generating one.
-    FrameScope scope(this, StackFrame::NONE);
+    FrameScope scope(this, StackFrame::NO_FRAME_TYPE);
     Call(BUILTIN_CODE(isolate(), Abort), RelocInfo::CODE_TARGET);
   } else {
     Call(BUILTIN_CODE(isolate(), Abort), RelocInfo::CODE_TARGET);
@@ -5525,7 +5514,7 @@ void TurboAssembler::CallForDeoptimization(Builtin target, int, Label* exit,
                                            Label*) {
   BlockTrampolinePoolScope block_trampoline_pool(this);
   Lw(t9,
-     MemOperand(kRootRegister, IsolateData::builtin_entry_slot_offset(target)));
+     MemOperand(kRootRegister, IsolateData::BuiltinEntrySlotOffset(target)));
   Call(t9);
   DCHECK_EQ(SizeOfCodeGeneratedSince(exit),
             (kind == DeoptimizeKind::kLazy)

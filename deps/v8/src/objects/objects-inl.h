@@ -18,6 +18,7 @@
 #include "src/builtins/builtins.h"
 #include "src/common/external-pointer-inl.h"
 #include "src/common/globals.h"
+#include "src/common/ptr-compr-inl.h"
 #include "src/handles/handles-inl.h"
 #include "src/heap/factory.h"
 #include "src/heap/heap-write-barrier-inl.h"
@@ -59,7 +60,7 @@ Smi PropertyDetails::AsSmi() const {
 }
 
 int PropertyDetails::field_width_in_words() const {
-  DCHECK_EQ(location(), kField);
+  DCHECK_EQ(location(), PropertyLocation::kField);
   return 1;
 }
 
@@ -69,6 +70,14 @@ DEF_GETTER(HeapObject, IsClassBoilerplate, bool) {
 
 bool Object::IsTaggedIndex() const {
   return IsSmi() && TaggedIndex::IsValid(TaggedIndex(ptr()).value());
+}
+
+bool Object::InSharedHeap() const {
+  return IsHeapObject() && HeapObject::cast(*this).InSharedHeap();
+}
+
+bool Object::InSharedWritableHeap() const {
+  return IsHeapObject() && HeapObject::cast(*this).InSharedWritableHeap();
 }
 
 #define IS_TYPE_FUNCTION_DEF(type_)                                        \
@@ -133,6 +142,15 @@ bool Object::IsPrivateSymbol() const {
 
 bool Object::IsNoSharedNameSentinel() const {
   return *this == SharedFunctionInfo::kNoSharedNameSentinel;
+}
+
+bool HeapObject::InSharedHeap() const {
+  if (IsReadOnlyHeapObject(*this)) return V8_SHARED_RO_HEAP_BOOL;
+  return InSharedWritableHeap();
+}
+
+bool HeapObject::InSharedWritableHeap() const {
+  return BasicMemoryChunk::FromHeapObject(*this)->InSharedHeap();
 }
 
 bool HeapObject::IsNullOrUndefined(Isolate* isolate) const {
@@ -648,6 +666,10 @@ MaybeObjectSlot HeapObject::RawMaybeWeakField(int byte_offset) const {
   return MaybeObjectSlot(field_address(byte_offset));
 }
 
+CodeObjectSlot HeapObject::RawCodeField(int byte_offset) const {
+  return CodeObjectSlot(field_address(byte_offset));
+}
+
 MapWord MapWord::FromMap(const Map map) {
   DCHECK(map.is_null() || !MapWord::IsPacked(map.ptr()));
 #ifdef V8_MAP_PACKING
@@ -675,6 +697,22 @@ MapWord MapWord::FromForwardingAddress(HeapObject object) {
 
 HeapObject MapWord::ToForwardingAddress() {
   DCHECK(IsForwardingAddress());
+  HeapObject obj = HeapObject::FromAddress(value_);
+  // For objects allocated outside of the main pointer compression cage the
+  // variant with explicit cage base must be used.
+  DCHECK_IMPLIES(V8_EXTERNAL_CODE_SPACE_BOOL, !obj.IsCode());
+  return obj;
+}
+
+HeapObject MapWord::ToForwardingAddress(PtrComprCageBase host_cage_base) {
+  DCHECK(IsForwardingAddress());
+  if (V8_EXTERNAL_CODE_SPACE_BOOL) {
+    // Recompress value_ using proper host_cage_base since the map word
+    // has the upper 32 bits that correspond to the main cage base value.
+    Address value =
+        DecompressTaggedPointer(host_cage_base, CompressTagged(value_));
+    return HeapObject::FromAddress(value);
+  }
   return HeapObject::FromAddress(value_);
 }
 
@@ -751,13 +789,22 @@ void HeapObject::set_map(Map value, ReleaseStoreTag tag) {
 }
 
 // Unsafe accessor omitting write barrier.
-void HeapObject::set_map_no_write_barrier(Map value) {
+void HeapObject::set_map_no_write_barrier(Map value, RelaxedStoreTag tag) {
 #ifdef VERIFY_HEAP
   if (FLAG_verify_heap && !value.is_null()) {
     GetHeapFromWritableObject(*this)->VerifyObjectLayoutChange(*this, value);
   }
 #endif
-  set_map_word(MapWord::FromMap(value), kRelaxedStore);
+  set_map_word(MapWord::FromMap(value), tag);
+}
+
+void HeapObject::set_map_no_write_barrier(Map value, ReleaseStoreTag tag) {
+#ifdef VERIFY_HEAP
+  if (FLAG_verify_heap && !value.is_null()) {
+    GetHeapFromWritableObject(*this)->VerifyObjectLayoutChange(*this, value);
+  }
+#endif
+  set_map_word(MapWord::FromMap(value), tag);
 }
 
 void HeapObject::set_map_after_allocation(Map value, WriteBarrierMode mode) {

@@ -28,12 +28,11 @@ RegExpMacroAssembler::RegExpMacroAssembler(Isolate* isolate, Zone* zone)
       isolate_(isolate),
       zone_(zone) {}
 
-RegExpMacroAssembler::~RegExpMacroAssembler() = default;
-
 bool RegExpMacroAssembler::has_backtrack_limit() const {
   return backtrack_limit_ != JSRegExp::kNoBacktrackLimit;
 }
 
+// static
 int RegExpMacroAssembler::CaseInsensitiveCompareNonUnicode(Address byte_offset1,
                                                            Address byte_offset2,
                                                            size_t byte_length,
@@ -62,6 +61,7 @@ int RegExpMacroAssembler::CaseInsensitiveCompareNonUnicode(Address byte_offset1,
 #endif
 }
 
+// static
 int RegExpMacroAssembler::CaseInsensitiveCompareUnicode(Address byte_offset1,
                                                         Address byte_offset2,
                                                         size_t byte_length,
@@ -135,17 +135,6 @@ void RegExpMacroAssembler::LoadCurrentCharacter(int cp_offset,
                            eats_at_least);
 }
 
-bool RegExpMacroAssembler::CheckSpecialCharacterClass(base::uc16 type,
-                                                      Label* on_no_match) {
-  return false;
-}
-
-NativeRegExpMacroAssembler::NativeRegExpMacroAssembler(Isolate* isolate,
-                                                       Zone* zone)
-    : RegExpMacroAssembler(isolate, zone) {}
-
-NativeRegExpMacroAssembler::~NativeRegExpMacroAssembler() = default;
-
 void NativeRegExpMacroAssembler::LoadCurrentCharacterImpl(
     int cp_offset, Label* on_end_of_input, bool check_bounds, int characters,
     int eats_at_least) {
@@ -164,13 +153,14 @@ void NativeRegExpMacroAssembler::LoadCurrentCharacterImpl(
   LoadCurrentCharacterUnchecked(cp_offset, characters);
 }
 
-bool NativeRegExpMacroAssembler::CanReadUnaligned() {
+bool NativeRegExpMacroAssembler::CanReadUnaligned() const {
   return FLAG_enable_regexp_unaligned_accesses && !slow_safe();
 }
 
 #ifndef COMPILING_IRREGEXP_FOR_EXTERNAL_EMBEDDER
 
 // This method may only be called after an interrupt.
+// static
 int NativeRegExpMacroAssembler::CheckStackGuardState(
     Isolate* isolate, int start_index, RegExp::CallOrigin call_origin,
     Address* return_address, Code re_code, Address* subject,
@@ -298,6 +288,15 @@ int NativeRegExpMacroAssembler::Match(Handle<JSRegExp> regexp,
                  offsets_vector_length, isolate, *regexp);
 }
 
+// static
+int NativeRegExpMacroAssembler::ExecuteForTesting(
+    String input, int start_offset, const byte* input_start,
+    const byte* input_end, int* output, int output_size, Isolate* isolate,
+    JSRegExp regexp) {
+  return Execute(input, start_offset, input_start, input_end, output,
+                 output_size, isolate, regexp);
+}
+
 // Returns a {Result} sentinel, or the number of successful matches.
 // TODO(pthier): The JSRegExp object is passed to native irregexp code to match
 // the signature of the interpreter. We should get rid of JS objects passed to
@@ -306,23 +305,21 @@ int NativeRegExpMacroAssembler::Execute(
     String input,  // This needs to be the unpacked (sliced, cons) string.
     int start_offset, const byte* input_start, const byte* input_end,
     int* output, int output_size, Isolate* isolate, JSRegExp regexp) {
-  // Ensure that the minimum stack has been allocated.
   RegExpStackScope stack_scope(isolate);
-  Address stack_base = stack_scope.stack()->stack_base();
 
   bool is_one_byte = String::IsOneByteRepresentationUnderneath(input);
-  Code code = FromCodeT(CodeT::cast(regexp.Code(is_one_byte)));
+  Code code = FromCodeT(CodeT::cast(regexp.code(is_one_byte)));
   RegExp::CallOrigin call_origin = RegExp::CallOrigin::kFromRuntime;
 
-  using RegexpMatcherSig = int(
-      Address input_string, int start_offset, const byte* input_start,
-      const byte* input_end, int* output, int output_size, Address stack_base,
-      int call_origin, Isolate* isolate, Address regexp);
+  using RegexpMatcherSig =
+      // NOLINTNEXTLINE(readability/casting)
+      int(Address input_string, int start_offset, const byte* input_start,
+          const byte* input_end, int* output, int output_size, int call_origin,
+          Isolate* isolate, Address regexp);
 
   auto fn = GeneratedCode<RegexpMatcherSig>::FromCode(code);
-  int result =
-      fn.Call(input.ptr(), start_offset, input_start, input_end, output,
-              output_size, stack_base, call_origin, isolate, regexp.ptr());
+  int result = fn.Call(input.ptr(), start_offset, input_start, input_end,
+                       output, output_size, call_origin, isolate, regexp.ptr());
   DCHECK_GE(result, SMALLEST_REGEXP_RESULT);
 
   if (result == EXCEPTION && !isolate->has_pending_exception()) {
@@ -382,22 +379,24 @@ const byte NativeRegExpMacroAssembler::word_character_map[] = {
 };
 // clang-format on
 
-Address NativeRegExpMacroAssembler::GrowStack(Address stack_pointer,
-                                              Address* stack_base,
-                                              Isolate* isolate) {
+// static
+Address NativeRegExpMacroAssembler::GrowStack(Isolate* isolate) {
+  DisallowGarbageCollection no_gc;
+
   RegExpStack* regexp_stack = isolate->regexp_stack();
-  size_t size = regexp_stack->stack_capacity();
-  Address old_stack_base = regexp_stack->stack_base();
-  DCHECK(old_stack_base == *stack_base);
-  DCHECK(stack_pointer <= old_stack_base);
-  DCHECK(static_cast<size_t>(old_stack_base - stack_pointer) <= size);
-  Address new_stack_base = regexp_stack->EnsureCapacity(size * 2);
-  if (new_stack_base == kNullAddress) {
-    return kNullAddress;
-  }
-  *stack_base = new_stack_base;
-  intptr_t stack_content_size = old_stack_base - stack_pointer;
-  return new_stack_base - stack_content_size;
+  const size_t old_size = regexp_stack->memory_size();
+
+#ifdef DEBUG
+  const Address old_stack_top = regexp_stack->memory_top();
+  const Address old_stack_pointer = regexp_stack->stack_pointer();
+  CHECK_LE(old_stack_pointer, old_stack_top);
+  CHECK_LE(static_cast<size_t>(old_stack_top - old_stack_pointer), old_size);
+#endif  // DEBUG
+
+  Address new_stack_base = regexp_stack->EnsureCapacity(old_size * 2);
+  if (new_stack_base == kNullAddress) return kNullAddress;
+
+  return regexp_stack->stack_pointer();
 }
 
 }  // namespace internal

@@ -83,9 +83,6 @@ class V8_EXPORT_PRIVATE MarkerBase {
       v8::base::TimeDelta = kMaximumIncrementalStepDuration,
       size_t marked_bytes_limit = 0);
 
-  // Makes marking progress when allocation a new lab.
-  void AdvanceMarkingOnAllocation();
-
   // Signals leaving the atomic marking pause. This method expects no more
   // objects to be marked and merely updates marking states if needed.
   void LeaveAtomicPause();
@@ -141,6 +138,8 @@ class V8_EXPORT_PRIVATE MarkerBase {
   bool IsMarking() const { return is_marking_; }
 
  protected:
+  class IncrementalMarkingAllocationObserver;
+
   static constexpr v8::base::TimeDelta kMaximumIncrementalStepDuration =
       v8::base::TimeDelta::FromMilliseconds(2);
 
@@ -164,11 +163,15 @@ class V8_EXPORT_PRIVATE MarkerBase {
 
   void VisitRoots(MarkingConfig::StackState);
 
+  bool VisitCrossThreadPersistentsIfNeeded();
+
   void MarkNotFullyConstructedObjects();
 
   void ScheduleIncrementalMarkingTask();
 
   bool IncrementalMarkingStep(MarkingConfig::StackState);
+
+  void AdvanceMarkingOnAllocation();
 
   HeapBase& heap_;
   MarkingConfig config_ = MarkingConfig::Default();
@@ -176,6 +179,8 @@ class V8_EXPORT_PRIVATE MarkerBase {
   cppgc::Platform* platform_;
   std::shared_ptr<cppgc::TaskRunner> foreground_task_runner_;
   IncrementalMarkingTask::Handle incremental_marking_handle_;
+  std::unique_ptr<IncrementalMarkingAllocationObserver>
+      incremental_marking_allocation_observer_;
 
   MarkingWorklists marking_worklists_;
   MutatorMarkingState mutator_marking_state_;
@@ -186,6 +191,7 @@ class V8_EXPORT_PRIVATE MarkerBase {
   std::unique_ptr<ConcurrentMarkerBase> concurrent_marker_{nullptr};
 
   bool main_marking_disabled_for_testing_{false};
+  bool visited_cross_thread_persistents_in_atomic_pause_{false};
 
   friend class MarkerFactory;
 };

@@ -5,9 +5,16 @@
 #include "src/init/vm-cage.h"
 
 #include "include/v8-internal.h"
+#include "src/base/bits.h"
 #include "src/base/bounded-page-allocator.h"
 #include "src/base/lazy-instance.h"
 #include "src/utils/allocation.h"
+
+#if defined(V8_OS_WIN)
+#include <windows.h>
+// This has to come after windows.h.
+#include <versionhelpers.h>  // For IsWindows8Point1OrGreater().
+#endif
 
 namespace v8 {
 namespace internal {
@@ -15,24 +22,51 @@ namespace internal {
 #ifdef V8_VIRTUAL_MEMORY_CAGE
 
 bool V8VirtualMemoryCage::Initialize(PageAllocator* page_allocator) {
-  constexpr bool use_guard_regions = true;
-  return Initialize(page_allocator, kVirtualMemoryCageSize, use_guard_regions);
+  bool use_guard_regions = true;
+  size_t size = kVirtualMemoryCageSize;
+#if defined(V8_OS_WIN)
+  if (!IsWindows8Point1OrGreater()) {
+    // On Windows pre 8.1, reserving virtual memory is an expensive operation,
+    // possibly because page table entries are created for the address range.
+    // For example, a 1TB reservation increases private memory usage by 2GB. As
+    // such, we can unfortunately only create a minimal cage on these version,
+    // without guard regions and without our desired security properties.
+    use_guard_regions = false;
+    size = kVirtualMemoryCageMinimumSize;
+  }
+#endif
+  return Initialize(page_allocator, size, use_guard_regions);
 }
 
 bool V8VirtualMemoryCage::Initialize(v8::PageAllocator* page_allocator,
                                      size_t size, bool use_guard_regions) {
   CHECK(!initialized_);
   CHECK(!disabled_);
+  CHECK(base::bits::IsPowerOfTwo(size));
   CHECK_GE(size, kVirtualMemoryCageMinimumSize);
 
-  size_t reservation_size = size;
-  if (use_guard_regions) {
-    reservation_size += 2 * kVirtualMemoryCageGuardRegionSize;
+  // Currently, we allow the cage to be smaller than the requested size. This
+  // way, we can gracefully handle cage reservation failures during the initial
+  // rollout and can collect data on how often these occur. In the future, we
+  // will likely either require the cage to always have a fixed size or will
+  // design CagedPointers (pointers that are guaranteed to point into the cage,
+  // e.g. because they are stored as offsets from the cage base) in a way that
+  // doesn't reduce the cage's security properties if it has a smaller size.
+  // Which of these options is ultimately taken likey depends on how frequently
+  // cage reservation failures occur in practice.
+  while (!base_ && size >= kVirtualMemoryCageMinimumSize) {
+    size_t reservation_size = size;
+    if (use_guard_regions) {
+      reservation_size += 2 * kVirtualMemoryCageGuardRegionSize;
+    }
+    base_ = reinterpret_cast<Address>(page_allocator->AllocatePages(
+        nullptr, reservation_size, kVirtualMemoryCageAlignment,
+        PageAllocator::kNoAccess));
+    if (!base_) {
+      size /= 2;
+    }
   }
 
-  base_ = reinterpret_cast<Address>(page_allocator->AllocatePages(
-      nullptr, reservation_size, kVirtualMemoryCageAlignment,
-      PageAllocator::kNoAccess));
   if (!base_) return false;
 
   if (use_guard_regions) {
@@ -43,9 +77,9 @@ bool V8VirtualMemoryCage::Initialize(v8::PageAllocator* page_allocator,
   page_allocator_ = page_allocator;
   size_ = size;
 
-  data_cage_page_allocator_ = std::make_unique<base::BoundedPageAllocator>(
-      page_allocator_, data_cage_base(), data_cage_size(),
-      page_allocator_->AllocatePageSize());
+  cage_page_allocator_ = std::make_unique<base::BoundedPageAllocator>(
+      page_allocator_, base_, size_, page_allocator_->AllocatePageSize(),
+      base::PageInitializationMode::kAllocatedPagesMustBeZeroInitialized);
 
   initialized_ = true;
 
@@ -54,7 +88,7 @@ bool V8VirtualMemoryCage::Initialize(v8::PageAllocator* page_allocator,
 
 void V8VirtualMemoryCage::TearDown() {
   if (initialized_) {
-    data_cage_page_allocator_.reset();
+    cage_page_allocator_.reset();
     Address reservation_base = base_;
     size_t reservation_size = size_;
     if (has_guard_regions_) {

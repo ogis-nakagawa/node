@@ -177,7 +177,8 @@ CopyAndForwardResult Scavenger::SemiSpaceCopyObject(
   return CopyAndForwardResult::FAILURE;
 }
 
-template <typename THeapObjectSlot>
+template <typename THeapObjectSlot,
+          Scavenger::PromotionHeapChoice promotion_heap_choice>
 CopyAndForwardResult Scavenger::PromoteObject(Map map, THeapObjectSlot slot,
                                               HeapObject object,
                                               int object_size,
@@ -187,8 +188,18 @@ CopyAndForwardResult Scavenger::PromoteObject(Map map, THeapObjectSlot slot,
                 "Only FullHeapObjectSlot and HeapObjectSlot are expected here");
   DCHECK_GE(object_size, Heap::kMinObjectSizeInTaggedWords * kTaggedSize);
   AllocationAlignment alignment = HeapObject::RequiredAlignment(map);
-  AllocationResult allocation = allocator_.Allocate(
-      OLD_SPACE, object_size, AllocationOrigin::kGC, alignment);
+  AllocationResult allocation;
+  switch (promotion_heap_choice) {
+    case kPromoteIntoLocalHeap:
+      allocation = allocator_.Allocate(OLD_SPACE, object_size,
+                                       AllocationOrigin::kGC, alignment);
+      break;
+    case kPromoteIntoSharedHeap:
+      DCHECK_NOT_NULL(shared_old_allocator_);
+      allocation = shared_old_allocator_->AllocateRaw(object_size, alignment,
+                                                      AllocationOrigin::kGC);
+      break;
+  }
 
   HeapObject target;
   if (allocation.To(&target)) {
@@ -243,7 +254,8 @@ bool Scavenger::HandleLargeObject(Map map, HeapObject object, int object_size,
   return false;
 }
 
-template <typename THeapObjectSlot>
+template <typename THeapObjectSlot,
+          Scavenger::PromotionHeapChoice promotion_heap_choice>
 SlotCallbackResult Scavenger::EvacuateObjectDefault(
     Map map, THeapObjectSlot slot, HeapObject object, int object_size,
     ObjectFields object_fields) {
@@ -270,9 +282,10 @@ SlotCallbackResult Scavenger::EvacuateObjectDefault(
   }
 
   // We may want to promote this object if the object was already semi-space
-  // copied in a previes young generation GC or if the semi-space copy above
+  // copied in a previous young generation GC or if the semi-space copy above
   // failed.
-  result = PromoteObject(map, slot, object, object_size, object_fields);
+  result = PromoteObject<THeapObjectSlot, promotion_heap_choice>(
+      map, slot, object, object_size, object_fields);
   if (result != CopyAndForwardResult::FAILURE) {
     return RememberedSetEntryNeeded(result);
   }
@@ -341,10 +354,10 @@ SlotCallbackResult Scavenger::EvacuateShortcutCandidate(Map map,
                           kReleaseStore);
       return Heap::InYoungGeneration(target) ? KEEP_SLOT : REMOVE_SLOT;
     }
-    Map map = first_word.ToMap();
-    SlotCallbackResult result =
-        EvacuateObjectDefault(map, slot, first, first.SizeFromMap(map),
-                              Map::ObjectFieldsFrom(map.visitor_id()));
+    Map first_map = first_word.ToMap();
+    SlotCallbackResult result = EvacuateObjectDefault(
+        first_map, slot, first, first.SizeFromMap(first_map),
+        Map::ObjectFieldsFrom(first_map.visitor_id()));
     object.set_map_word(MapWord::FromForwardingAddress(slot.ToHeapObject()),
                         kReleaseStore);
     return result;
@@ -353,6 +366,19 @@ SlotCallbackResult Scavenger::EvacuateShortcutCandidate(Map map,
             Map::ObjectFieldsFrom(map.visitor_id()));
   return EvacuateObjectDefault(map, slot, object, object_size,
                                ObjectFields::kMaybePointers);
+}
+
+template <typename THeapObjectSlot>
+SlotCallbackResult Scavenger::EvacuateInPlaceInternalizableString(
+    Map map, THeapObjectSlot slot, String object, int object_size,
+    ObjectFields object_fields) {
+  DCHECK(String::IsInPlaceInternalizable(map.instance_type()));
+  DCHECK_EQ(object_fields, Map::ObjectFieldsFrom(map.visitor_id()));
+  if (shared_string_table_) {
+    return EvacuateObjectDefault<THeapObjectSlot, kPromoteIntoSharedHeap>(
+        map, slot, object, object_size, object_fields);
+  }
+  return EvacuateObjectDefault(map, slot, object, object_size, object_fields);
 }
 
 template <typename THeapObjectSlot>
@@ -378,6 +404,19 @@ SlotCallbackResult Scavenger::EvacuateObject(THeapObjectSlot slot, Map map,
       // At the moment we don't allow weak pointers to cons strings.
       return EvacuateShortcutCandidate(
           map, slot, ConsString::unchecked_cast(source), size);
+    case kVisitSeqOneByteString:
+    case kVisitSeqTwoByteString:
+      DCHECK(String::IsInPlaceInternalizable(map.instance_type()));
+      return EvacuateInPlaceInternalizableString(
+          map, slot, String::unchecked_cast(source), size,
+          ObjectFields::kMaybePointers);
+    case kVisitDataObject:  // External strings have kVisitDataObject.
+      if (String::IsInPlaceInternalizable(map.instance_type())) {
+        return EvacuateInPlaceInternalizableString(
+            map, slot, String::unchecked_cast(source), size,
+            ObjectFields::kDataOnly);
+      }
+      V8_FALLTHROUGH;
     default:
       return EvacuateObjectDefault(map, slot, source, size,
                                    Map::ObjectFieldsFrom(visitor_id));

@@ -281,6 +281,12 @@ class V8_EXPORT Isolate {
      */
     int embedder_wrapper_type_index = -1;
     int embedder_wrapper_object_index = -1;
+
+    /**
+     * The following parameter is experimental and may change significantly.
+     * This is currently for internal testing.
+     */
+    Isolate* experimental_attach_to_shared_isolate = nullptr;
   };
 
   /**
@@ -612,16 +618,6 @@ class V8_EXPORT Isolate {
   using AbortOnUncaughtExceptionCallback = bool (*)(Isolate*);
   void SetAbortOnUncaughtExceptionCallback(
       AbortOnUncaughtExceptionCallback callback);
-
-  /**
-   * This specifies the callback called by the upcoming dynamic
-   * import() language feature to load modules.
-   */
-  V8_DEPRECATED(
-      "Use the version of SetHostImportModuleDynamicallyCallback that takes a "
-      "HostImportModuleDynamicallyWithImportAssertionsCallback instead")
-  void SetHostImportModuleDynamicallyCallback(
-      HostImportModuleDynamicallyCallback callback);
 
   /**
    * This specifies the callback called by the upcoming dynamic
@@ -1491,6 +1487,9 @@ class V8_EXPORT Isolate {
   void SetWasmSimdEnabledCallback(WasmSimdEnabledCallback callback);
 
   void SetWasmExceptionsEnabledCallback(WasmExceptionsEnabledCallback callback);
+
+  void SetWasmDynamicTieringEnabledCallback(
+      WasmDynamicTieringEnabledCallback callback);
 
   void SetSharedArrayBufferConstructorEnabledCallback(
       SharedArrayBufferConstructorEnabledCallback callback);

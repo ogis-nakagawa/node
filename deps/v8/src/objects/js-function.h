@@ -7,7 +7,6 @@
 
 #include "src/objects/code-kind.h"
 #include "src/objects/js-objects.h"
-#include "torque-generated/field-offsets.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -242,7 +241,7 @@ class JSFunction
   // Creates a map that matches the constructor's initial map, but with
   // [[prototype]] being new.target.prototype. Because new.target can be a
   // JSProxy, this can call back into JavaScript.
-  static V8_WARN_UNUSED_RESULT MaybeHandle<Map> GetDerivedMap(
+  V8_EXPORT_PRIVATE static V8_WARN_UNUSED_RESULT MaybeHandle<Map> GetDerivedMap(
       Isolate* isolate, Handle<JSFunction> constructor,
       Handle<JSReceiver> new_target);
 

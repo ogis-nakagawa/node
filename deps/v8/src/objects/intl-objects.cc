@@ -23,7 +23,9 @@
 #include "src/objects/js-locale-inl.h"
 #include "src/objects/js-locale.h"
 #include "src/objects/js-number-format-inl.h"
+#include "src/objects/managed-inl.h"
 #include "src/objects/objects-inl.h"
+#include "src/objects/option-utils.h"
 #include "src/objects/property-descriptor.h"
 #include "src/objects/smi.h"
 #include "src/objects/string.h"
@@ -181,19 +183,19 @@ const UChar* GetUCharBufferFromFlat(const String::FlatContent& flat,
 template <typename T>
 MaybeHandle<T> New(Isolate* isolate, Handle<JSFunction> constructor,
                    Handle<Object> locales, Handle<Object> options,
-                   const char* method) {
+                   const char* method_name) {
   Handle<Map> map;
   ASSIGN_RETURN_ON_EXCEPTION(
       isolate, map,
       JSFunction::GetDerivedMap(isolate, constructor, constructor), T);
-  return T::New(isolate, map, locales, options, method);
+  return T::New(isolate, map, locales, options, method_name);
 }
 }  // namespace
 
 const uint8_t* Intl::ToLatin1LowerTable() { return &kToLower[0]; }
 
 icu::UnicodeString Intl::ToICUUnicodeString(Isolate* isolate,
-                                            Handle<String> string) {
+                                            Handle<String> string, int offset) {
   DCHECK(string->IsFlat());
   DisallowGarbageCollection no_gc;
   std::unique_ptr<base::uc16[]> sap;
@@ -204,17 +206,20 @@ icu::UnicodeString Intl::ToICUUnicodeString(Isolate* isolate,
   const UChar* uchar_buffer = nullptr;
   const String::FlatContent& flat = string->GetFlatContent(no_gc);
   int32_t length = string->length();
+  DCHECK_LE(offset, length);
   if (flat.IsOneByte() && length <= kShortStringSize) {
     CopyChars(short_string_buffer, flat.ToOneByteVector().begin(), length);
     uchar_buffer = short_string_buffer;
   } else {
     uchar_buffer = GetUCharBufferFromFlat(flat, &sap, length);
   }
-  return icu::UnicodeString(uchar_buffer, length);
+  return icu::UnicodeString(uchar_buffer + offset, length - offset);
 }
 
 namespace {
-icu::StringPiece ToICUStringPiece(Isolate* isolate, Handle<String> string) {
+
+icu::StringPiece ToICUStringPiece(Isolate* isolate, Handle<String> string,
+                                  int offset = 0) {
   DCHECK(string->IsFlat());
   DisallowGarbageCollection no_gc;
 
@@ -222,13 +227,14 @@ icu::StringPiece ToICUStringPiece(Isolate* isolate, Handle<String> string) {
   if (!flat.IsOneByte()) return icu::StringPiece(nullptr, 0);
 
   int32_t length = string->length();
+  DCHECK_LT(offset, length);
   const char* char_buffer =
       reinterpret_cast<const char*>(flat.ToOneByteVector().begin());
   if (!String::IsAscii(char_buffer, length)) {
     return icu::StringPiece(nullptr, 0);
   }
 
-  return icu::StringPiece(char_buffer, length);
+  return icu::StringPiece(char_buffer + offset, length - offset);
 }
 
 MaybeHandle<String> LocaleConvertCase(Isolate* isolate, Handle<String> s,
@@ -427,7 +433,9 @@ std::string Intl::GetNumberingSystem(const icu::Locale& icu_locale) {
   UErrorCode status = U_ZERO_ERROR;
   std::unique_ptr<icu::NumberingSystem> numbering_system(
       icu::NumberingSystem::createInstance(icu_locale, status));
-  if (U_SUCCESS(status)) return numbering_system->getName();
+  if (U_SUCCESS(status) && !numbering_system->isAlgorithmic()) {
+    return numbering_system->getName();
+  }
   return "latn";
 }
 
@@ -650,82 +658,6 @@ MaybeHandle<Object> Intl::LegacyUnwrapReceiver(Isolate* isolate,
   }
 
   return receiver;
-}
-
-Maybe<bool> Intl::GetStringOption(Isolate* isolate, Handle<JSReceiver> options,
-                                  const char* property,
-                                  std::vector<const char*> values,
-                                  const char* service,
-                                  std::unique_ptr<char[]>* result) {
-  Handle<String> property_str =
-      isolate->factory()->NewStringFromAsciiChecked(property);
-
-  // 1. Let value be ? Get(options, property).
-  Handle<Object> value;
-  ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-      isolate, value,
-      Object::GetPropertyOrElement(isolate, options, property_str),
-      Nothing<bool>());
-
-  if (value->IsUndefined(isolate)) {
-    return Just(false);
-  }
-
-  // 2. c. Let value be ? ToString(value).
-  Handle<String> value_str;
-  ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-      isolate, value_str, Object::ToString(isolate, value), Nothing<bool>());
-  std::unique_ptr<char[]> value_cstr = value_str->ToCString();
-
-  // 2. d. if values is not undefined, then
-  if (values.size() > 0) {
-    // 2. d. i. If values does not contain an element equal to value,
-    // throw a RangeError exception.
-    for (size_t i = 0; i < values.size(); i++) {
-      if (strcmp(values.at(i), value_cstr.get()) == 0) {
-        // 2. e. return value
-        *result = std::move(value_cstr);
-        return Just(true);
-      }
-    }
-
-    Handle<String> service_str =
-        isolate->factory()->NewStringFromAsciiChecked(service);
-    THROW_NEW_ERROR_RETURN_VALUE(
-        isolate,
-        NewRangeError(MessageTemplate::kValueOutOfRange, value, service_str,
-                      property_str),
-        Nothing<bool>());
-  }
-
-  // 2. e. return value
-  *result = std::move(value_cstr);
-  return Just(true);
-}
-
-V8_WARN_UNUSED_RESULT Maybe<bool> Intl::GetBoolOption(
-    Isolate* isolate, Handle<JSReceiver> options, const char* property,
-    const char* service, bool* result) {
-  Handle<String> property_str =
-      isolate->factory()->NewStringFromAsciiChecked(property);
-
-  // 1. Let value be ? Get(options, property).
-  Handle<Object> value;
-  ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-      isolate, value,
-      Object::GetPropertyOrElement(isolate, options, property_str),
-      Nothing<bool>());
-
-  // 2. If value is not undefined, then
-  if (!value->IsUndefined(isolate)) {
-    // 2. b. i. Let value be ToBoolean(value).
-    *result = value->BooleanValue(isolate);
-
-    // 2. e. return value
-    return Just(true);
-  }
-
-  return Just(false);
 }
 
 namespace {
@@ -999,14 +931,70 @@ MaybeHandle<String> Intl::StringLocaleConvertCase(Isolate* isolate,
   }
 }
 
-MaybeHandle<Object> Intl::StringLocaleCompare(
+// static
+Intl::CompareStringsOptions Intl::CompareStringsOptionsFor(
+    Isolate* isolate, Handle<Object> locales, Handle<Object> options) {
+  if (!options->IsUndefined(isolate)) {
+    return CompareStringsOptions::kNone;
+  }
+
+  // Lists all of the available locales that are statically known to fulfill
+  // fast path conditions. See the StringLocaleCompareFastPath test as a
+  // starting point to update this list.
+  //
+  // Locale entries are roughly sorted s.t. common locales come first.
+  //
+  // The actual conditions are verified in debug builds in
+  // CollatorAllowsFastComparison.
+  static const char* const kFastLocales[] = {
+      "en-US", "en",    "fr", "es", "de", "pt", "it", "ca", "de-AT", "fi",
+      "id",    "id-ID", "ms", "nl", "pl", "ro", "sl", "sv", "sw",    "vi",
+  };
+
+  if (locales->IsUndefined(isolate)) {
+    static bool default_is_fast = false;
+
+    // The default locale is immutable after initialization.
+    static base::OnceType once = V8_ONCE_INIT;
+    base::CallOnce(&once, [&]() {
+      const std::string& default_locale = DefaultLocale(isolate);
+      for (const char* fast_locale : kFastLocales) {
+        if (strcmp(fast_locale, default_locale.c_str()) == 0) {
+          default_is_fast = true;
+          return;
+        }
+      }
+    });
+
+    return default_is_fast ? CompareStringsOptions::kTryFastPath
+                           : CompareStringsOptions::kNone;
+  }
+
+  if (!locales->IsString()) return CompareStringsOptions::kNone;
+
+  Handle<String> locales_string = Handle<String>::cast(locales);
+  for (const char* fast_locale : kFastLocales) {
+    if (locales_string->IsOneByteEqualTo(base::CStrVector(fast_locale))) {
+      return CompareStringsOptions::kTryFastPath;
+    }
+  }
+
+  return CompareStringsOptions::kNone;
+}
+
+base::Optional<int> Intl::StringLocaleCompare(
     Isolate* isolate, Handle<String> string1, Handle<String> string2,
-    Handle<Object> locales, Handle<Object> options, const char* method) {
+    Handle<Object> locales, Handle<Object> options, const char* method_name) {
   // We only cache the instance when locales is a string/undefined and
   // options is undefined, as that is the only case when the specified
   // side-effects of examining those arguments are unobservable.
-  bool can_cache = (locales->IsString() || locales->IsUndefined(isolate)) &&
-                   options->IsUndefined(isolate);
+  const bool can_cache =
+      (locales->IsString() || locales->IsUndefined(isolate)) &&
+      options->IsUndefined(isolate);
+  // We may be able to take the fast path, depending on the `locales` and
+  // `options` arguments.
+  const CompareStringsOptions compare_strings_options =
+      CompareStringsOptionsFor(isolate, locales, options);
   if (can_cache) {
     // Both locales and options are undefined, check the cache.
     icu::Collator* cached_icu_collator =
@@ -1015,7 +1003,7 @@ MaybeHandle<Object> Intl::StringLocaleCompare(
     // We may use the cached icu::Collator for a fast path.
     if (cached_icu_collator != nullptr) {
       return Intl::CompareStrings(isolate, *cached_icu_collator, string1,
-                                  string2);
+                                  string2, compare_strings_options);
     }
   }
 
@@ -1025,61 +1013,440 @@ MaybeHandle<Object> Intl::StringLocaleCompare(
       isolate);
 
   Handle<JSCollator> collator;
-  ASSIGN_RETURN_ON_EXCEPTION(
-      isolate, collator,
-      New<JSCollator>(isolate, constructor, locales, options, method), Object);
+  MaybeHandle<JSCollator> maybe_collator =
+      New<JSCollator>(isolate, constructor, locales, options, method_name);
+  if (!maybe_collator.ToHandle(&collator)) return {};
   if (can_cache) {
     isolate->set_icu_object_in_cache(
         Isolate::ICUObjectCacheType::kDefaultCollator, locales,
         std::static_pointer_cast<icu::UMemory>(collator->icu_collator().get()));
   }
   icu::Collator* icu_collator = collator->icu_collator().raw();
-  return Intl::CompareStrings(isolate, *icu_collator, string1, string2);
+  return Intl::CompareStrings(isolate, *icu_collator, string1, string2,
+                              compare_strings_options);
 }
 
-// ecma402/#sec-collator-comparestrings
-Handle<Object> Intl::CompareStrings(Isolate* isolate,
-                                    const icu::Collator& icu_collator,
-                                    Handle<String> string1,
-                                    Handle<String> string2) {
-  Factory* factory = isolate->factory();
+namespace {
 
+// Weights for the Unicode Collation Algorithm for charcodes [0x00,0x7F].
+// https://unicode.org/reports/tr10/.
+//
+// Generated from:
+//
+// $ wget http://www.unicode.org/Public/UCA/latest/allkeys.txt
+// $ cat ~/allkeys.txt | grep '^00[0-7].  ;' | sort | sed 's/[*.]/ /g' |\
+//   sed 's/.*\[ \(.*\)\].*/\1/' | python ~/gen_weights.py
+//
+// Where gen_weights.py does an ordinal rank s.t. weights fit in a uint8_t:
+//
+//   import sys
+//
+//   def to_ordinal(ws):
+//       weight_map = {}
+//       weights_uniq_sorted = sorted(set(ws))
+//       for i in range(0, len(weights_uniq_sorted)):
+//           weight_map[weights_uniq_sorted[i]] = i
+//       return [weight_map[x] for x in ws]
+//
+//   def print_weight_list(array_name, ws):
+//       print("constexpr uint8_t %s[] = {" % array_name, end = "")
+//       i = 0
+//       for w in ws:
+//           if (i % 16) == 0:
+//               print("\n  ", end = "")
+//           print("%3d," % w, end = "")
+//           i += 1
+//       print("\n};\n")
+//
+//   if __name__ == "__main__":
+//       l1s = []
+//       l3s = []
+//       for line in sys.stdin:
+//           weights = line.split()
+//           l1s.append(int(weights[0], 16))
+//           l3s.append(int(weights[2], 16))
+//       print_weight_list("kCollationWeightsL1", to_ordinal(l1s))
+//       print_weight_list("kCollationWeightsL3", to_ordinal(l3s))
+
+// clang-format off
+constexpr uint8_t kCollationWeightsL1[] = {
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  2,  3,  4,  5,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    6, 12, 16, 28, 38, 29, 27, 15, 17, 18, 24, 32,  9,  8, 14, 25,
+   39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 11, 10, 33, 34, 35, 13,
+   23, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+   64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 19, 26, 20, 31,  7,
+   30, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+   64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 21, 36, 22, 37,  0,
+};
+constexpr uint8_t kCollationWeightsL3[] = {
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,  1,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+    1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+    1,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+    2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  1,  1,  1,  1,  1,
+    1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+    1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  0,
+};
+constexpr int kCollationWeightsLength =
+    arraysize(kCollationWeightsL1);
+STATIC_ASSERT(kCollationWeightsLength == 128);
+STATIC_ASSERT(kCollationWeightsLength == arraysize(kCollationWeightsL3));
+// clang-format on
+
+// Normalize a comparison delta (usually `lhs - rhs`) to UCollationResult
+// values.
+constexpr UCollationResult ToUCollationResult(int delta) {
+  return delta < 0 ? UCollationResult::UCOL_LESS
+                   : (delta > 0 ? UCollationResult::UCOL_GREATER
+                                : UCollationResult::UCOL_EQUAL);
+}
+
+struct FastCompareStringsData {
+  UCollationResult l1_result = UCollationResult::UCOL_EQUAL;
+  UCollationResult l3_result = UCollationResult::UCOL_EQUAL;
+  int processed_until = 0;
+  int first_diff_at = 0;  // The first relevant diff (L1 if exists, else L3).
+  bool has_diff = false;
+
+  base::Optional<UCollationResult> FastCompareFailed(
+      int* processed_until_out) const {
+    if (has_diff) {
+      // Found some difference, continue there to ensure the generic algorithm
+      // picks it up.
+      *processed_until_out = first_diff_at;
+    } else {
+      // No difference found, reprocess the last processed character since it
+      // may be followed by a unicode combining character (which alters it's
+      // meaning).
+      *processed_until_out = std::max(processed_until - 1, 0);
+    }
+    return {};
+  }
+};
+
+template <class CharT>
+constexpr bool CanFastCompare(CharT c) {
+  return c < kCollationWeightsLength && kCollationWeightsL1[c] != 0;
+}
+
+template <class Char1T, class Char2T>
+bool FastCompareFlatString(const Char1T* lhs, const Char2T* rhs, int length,
+                           FastCompareStringsData* d) {
+  for (int i = 0; i < length; i++) {
+    const Char1T l = lhs[i];
+    const Char2T r = rhs[i];
+    if (!CanFastCompare(l) || !CanFastCompare(r)) {
+      d->processed_until = i;
+      return false;
+    }
+    UCollationResult l1_result =
+        ToUCollationResult(kCollationWeightsL1[l] - kCollationWeightsL1[r]);
+    if (l1_result != UCollationResult::UCOL_EQUAL) {
+      d->has_diff = true;
+      d->first_diff_at = i;
+      d->processed_until = i;
+      d->l1_result = l1_result;
+      return true;
+    }
+    if (l != r && d->l3_result == UCollationResult::UCOL_EQUAL) {
+      // Collapse the two-pass algorithm into one: if we find a difference in
+      // L1 weights, that is our result. If not, use the first L3 weight
+      // difference.
+      UCollationResult l3_result =
+          ToUCollationResult(kCollationWeightsL3[l] - kCollationWeightsL3[r]);
+      d->l3_result = l3_result;
+      if (!d->has_diff) {
+        d->has_diff = true;
+        d->first_diff_at = i;
+      }
+    }
+  }
+  d->processed_until = length;
+  return true;
+}
+
+bool FastCompareStringFlatContent(const String::FlatContent& lhs,
+                                  const String::FlatContent& rhs, int length,
+                                  FastCompareStringsData* d) {
+  if (lhs.IsOneByte()) {
+    base::Vector<const uint8_t> l = lhs.ToOneByteVector();
+    if (rhs.IsOneByte()) {
+      base::Vector<const uint8_t> r = rhs.ToOneByteVector();
+      return FastCompareFlatString(l.data(), r.data(), length, d);
+    } else {
+      base::Vector<const uint16_t> r = rhs.ToUC16Vector();
+      return FastCompareFlatString(l.data(), r.data(), length, d);
+    }
+  } else {
+    base::Vector<const uint16_t> l = lhs.ToUC16Vector();
+    if (rhs.IsOneByte()) {
+      base::Vector<const uint8_t> r = rhs.ToOneByteVector();
+      return FastCompareFlatString(l.data(), r.data(), length, d);
+    } else {
+      base::Vector<const uint16_t> r = rhs.ToUC16Vector();
+      return FastCompareFlatString(l.data(), r.data(), length, d);
+    }
+  }
+  UNREACHABLE();
+}
+
+bool CharIsAsciiOrOutOfBounds(const String::FlatContent& string,
+                              int string_length, int index) {
+  DCHECK_EQ(string.length(), string_length);
+  return index >= string_length || isascii(string.Get(index));
+}
+
+#ifdef DEBUG
+bool USetContainsAllAsciiItem(USet* set) {
+  static constexpr int kBufferSize = 64;
+  UChar buffer[kBufferSize];
+
+  const int length = uset_getItemCount(set);
+  for (int i = 0; i < length; i++) {
+    UChar32 start, end;
+    UErrorCode status = U_ZERO_ERROR;
+    const int item_length =
+        uset_getItem(set, i, &start, &end, buffer, kBufferSize, &status);
+    CHECK(U_SUCCESS(status));
+    DCHECK_GE(item_length, 0);
+
+    if (item_length == 0) {
+      // Empty string or a range.
+      if (isascii(start)) return true;
+    } else {
+      // A non-empty string.
+      bool all_ascii = true;
+      for (int j = 0; j < item_length; j++) {
+        if (!isascii(buffer[j])) {
+          all_ascii = false;
+          break;
+        }
+      }
+
+      if (all_ascii) return true;
+    }
+  }
+
+  return false;
+}
+
+bool CollatorAllowsFastComparison(const icu::Collator& icu_collator) {
+  UErrorCode status = U_ZERO_ERROR;
+
+  icu::Locale icu_locale(icu_collator.getLocale(ULOC_VALID_LOCALE, status));
+  DCHECK(U_SUCCESS(status));
+
+  static constexpr int kBufferSize = 64;
+  char buffer[kBufferSize];
+  const int collation_keyword_length =
+      icu_locale.getKeywordValue("collation", buffer, kBufferSize, status);
+  DCHECK(U_SUCCESS(status));
+  if (collation_keyword_length != 0) return false;
+
+  // These attributes must be set to the expected value for fast comparisons.
+  static constexpr struct {
+    UColAttribute attribute;
+    UColAttributeValue legal_value;
+  } kAttributeChecks[] = {
+      {UCOL_ALTERNATE_HANDLING, UCOL_NON_IGNORABLE},
+      {UCOL_CASE_FIRST, UCOL_OFF},
+      {UCOL_CASE_LEVEL, UCOL_OFF},
+      {UCOL_FRENCH_COLLATION, UCOL_OFF},
+      {UCOL_NUMERIC_COLLATION, UCOL_OFF},
+      {UCOL_STRENGTH, UCOL_TERTIARY},
+  };
+
+  for (const auto& check : kAttributeChecks) {
+    if (icu_collator.getAttribute(check.attribute, status) !=
+        check.legal_value) {
+      return false;
+    }
+    DCHECK(U_SUCCESS(status));
+  }
+
+  // No reordering codes are allowed.
+  int num_reorder_codes =
+      ucol_getReorderCodes(icu_collator.toUCollator(), nullptr, 0, &status);
+  if (num_reorder_codes != 0) return false;
+  DCHECK(U_SUCCESS(status));  // Must check *after* num_reorder_codes != 0.
+
+  // No tailored rules are allowed.
+  int32_t rules_length = 0;
+  ucol_getRules(icu_collator.toUCollator(), &rules_length);
+  if (rules_length != 0) return false;
+
+  USet* tailored_set = ucol_getTailoredSet(icu_collator.toUCollator(), &status);
+  DCHECK(U_SUCCESS(status));
+  if (USetContainsAllAsciiItem(tailored_set)) return false;
+  uset_close(tailored_set);
+
+  // No ASCII contractions or expansions are allowed.
+  USet* contractions = uset_openEmpty();
+  USet* expansions = uset_openEmpty();
+  ucol_getContractionsAndExpansions(icu_collator.toUCollator(), contractions,
+                                    expansions, true, &status);
+  if (USetContainsAllAsciiItem(contractions)) return false;
+  if (USetContainsAllAsciiItem(expansions)) return false;
+  DCHECK(U_SUCCESS(status));
+  uset_close(contractions);
+  uset_close(expansions);
+
+  return true;
+}
+#endif  // DEBUG
+
+// Fast comparison is implemented for charcodes for which the L1 collation
+// weight (see kCollactionWeightsL1 above) is not 0.
+//
+// Note it's possible to partially process strings as long as their leading
+// characters all satisfy the above criteria. In that case, and if the L3
+// result is EQUAL, we set `processed_until_out` to the first non-processed
+// index - future processing can begin at that offset.
+//
+// This fast path looks somewhat complex; mostly because it combines multiple
+// passes into one. The pseudo-code for simplified multi-pass algorithm is:
+//
+// {
+//   // We can only fast-compare a certain subset of the ASCII range.
+//   // Additionally, unicode characters can change the meaning of preceding
+//   // characters, for example: "o\u0308" is treated like "ö".
+//   //
+//   // Note, in the actual single-pass algorithm below, we tolerate non-ASCII
+//   // contents outside the relevant range.
+//   for (int i = 0; i < string1.length; i++) {
+//     if (!CanFastCompare(string1[i])) return {};
+//   }
+//   for (int i = 0; i < string2.length; i++) {
+//     if (!CanFastCompare(string2[i])) return {};
+//   }
+//
+//   // Apply L1 weights.
+//   for (int i = 0; i < common_length; i++) {
+//     Char1T c1 = string1[i];
+//     Char2T c2 = string2[i];
+//     if (L1Weight[c1] != L1Weight[c2]) {
+//       return L1Weight[c1] - L1Weight[c2];
+//     }
+//   }
+//
+//   // Strings are L1-equal up to the common length; if lengths differ, the
+//   // longer string is treated as 'greater'.
+//   if (string1.length != string2.length) string1.length - string2.length;
+//
+//   // Apply L3 weights.
+//   for (int i = 0; i < common_length; i++) {
+//     Char1T c1 = string1[i];
+//     Char2T c2 = string2[i];
+//     if (L3Weight[c1] != L3Weight[c2]) {
+//       return L3Weight[c1] - L3Weight[c2];
+//     }
+//   }
+//
+//   return UCOL_EQUAL;
+// }
+base::Optional<UCollationResult> TryFastCompareStrings(
+    Isolate* isolate, const icu::Collator& icu_collator, Handle<String> string1,
+    Handle<String> string2, int* processed_until_out) {
+  // TODO(jgruber): We could avoid the flattening (done by the caller) as well
+  // by implementing comparison through string iteration. This has visible
+  // performance benefits (e.g. 7% on CDJS) but complicates the code. Consider
+  // doing this in the future.
+  DCHECK(string1->IsFlat());
+  DCHECK(string2->IsFlat());
+
+  *processed_until_out = 0;
+
+#ifdef DEBUG
+  // Checked by the caller, see CompareStringsOptionsFor.
+  SLOW_DCHECK(CollatorAllowsFastComparison(icu_collator));
+  USE(CollatorAllowsFastComparison);
+#endif  // DEBUG
+
+  DCHECK(!SharedStringAccessGuardIfNeeded::IsNeeded(*string1));
+  DCHECK(!SharedStringAccessGuardIfNeeded::IsNeeded(*string2));
+
+  const int length1 = string1->length();
+  const int length2 = string2->length();
+  int common_length = std::min(length1, length2);
+
+  FastCompareStringsData d;
+  DisallowGarbageCollection no_gc;
+  const String::FlatContent& flat1 = string1->GetFlatContent(no_gc);
+  const String::FlatContent& flat2 = string2->GetFlatContent(no_gc);
+  if (!FastCompareStringFlatContent(flat1, flat2, common_length, &d)) {
+    DCHECK_EQ(d.l1_result, UCollationResult::UCOL_EQUAL);
+    return d.FastCompareFailed(processed_until_out);
+  }
+
+  // The result is only valid if the last processed character is not followed
+  // by a unicode combining character (we are overly strict and restrict to
+  // ASCII).
+  if (!CharIsAsciiOrOutOfBounds(flat1, length1, d.processed_until + 1) ||
+      !CharIsAsciiOrOutOfBounds(flat2, length2, d.processed_until + 1)) {
+    return d.FastCompareFailed(processed_until_out);
+  }
+
+  if (d.l1_result != UCollationResult::UCOL_EQUAL) {
+    return d.l1_result;
+  }
+
+  // Strings are L1-equal up to their common length, length differences win.
+  UCollationResult length_result = ToUCollationResult(length1 - length2);
+  if (length_result != UCollationResult::UCOL_EQUAL) return length_result;
+
+  // L1-equal and same length, the L3 result wins.
+  return d.l3_result;
+}
+
+}  // namespace
+
+// ecma402/#sec-collator-comparestrings
+int Intl::CompareStrings(Isolate* isolate, const icu::Collator& icu_collator,
+                         Handle<String> string1, Handle<String> string2,
+                         CompareStringsOptions compare_strings_options) {
   // Early return for identical strings.
   if (string1.is_identical_to(string2)) {
-    return factory->NewNumberFromInt(UCollationResult::UCOL_EQUAL);
+    return UCollationResult::UCOL_EQUAL;
   }
 
   // Early return for empty strings.
-  if (string1->length() == 0) {
-    return factory->NewNumberFromInt(string2->length() == 0
-                                         ? UCollationResult::UCOL_EQUAL
-                                         : UCollationResult::UCOL_LESS);
-  }
-  if (string2->length() == 0) {
-    return factory->NewNumberFromInt(UCollationResult::UCOL_GREATER);
+  if (string1->length() == 0 || string2->length() == 0) {
+    return ToUCollationResult(string1->length() - string2->length());
   }
 
   string1 = String::Flatten(isolate, string1);
   string2 = String::Flatten(isolate, string2);
 
+  int processed_until = 0;
+  if (compare_strings_options == CompareStringsOptions::kTryFastPath) {
+    base::Optional<int> maybe_result = TryFastCompareStrings(
+        isolate, icu_collator, string1, string2, &processed_until);
+    if (maybe_result.has_value()) return maybe_result.value();
+  }
+
   UCollationResult result;
   UErrorCode status = U_ZERO_ERROR;
-  icu::StringPiece string_piece1 = ToICUStringPiece(isolate, string1);
+  icu::StringPiece string_piece1 =
+      ToICUStringPiece(isolate, string1, processed_until);
   if (!string_piece1.empty()) {
-    icu::StringPiece string_piece2 = ToICUStringPiece(isolate, string2);
+    icu::StringPiece string_piece2 =
+        ToICUStringPiece(isolate, string2, processed_until);
     if (!string_piece2.empty()) {
       result = icu_collator.compareUTF8(string_piece1, string_piece2, status);
       DCHECK(U_SUCCESS(status));
-      return factory->NewNumberFromInt(result);
+      return result;
     }
   }
 
-  icu::UnicodeString string_val1 = Intl::ToICUUnicodeString(isolate, string1);
-  icu::UnicodeString string_val2 = Intl::ToICUUnicodeString(isolate, string2);
+  icu::UnicodeString string_val1 =
+      Intl::ToICUUnicodeString(isolate, string1, processed_until);
+  icu::UnicodeString string_val2 =
+      Intl::ToICUUnicodeString(isolate, string2, processed_until);
   result = icu_collator.compare(string_val1, string_val2, status);
   DCHECK(U_SUCCESS(status));
-
-  return factory->NewNumberFromInt(result);
+  return result;
 }
 
 // ecma402/#sup-properties-of-the-number-prototype-object
@@ -1087,7 +1454,7 @@ MaybeHandle<String> Intl::NumberToLocaleString(Isolate* isolate,
                                                Handle<Object> num,
                                                Handle<Object> locales,
                                                Handle<Object> options,
-                                               const char* method) {
+                                               const char* method_name) {
   Handle<Object> numeric_obj;
   ASSIGN_RETURN_ON_EXCEPTION(isolate, numeric_obj,
                              Object::ToNumeric(isolate, num), String);
@@ -1117,7 +1484,7 @@ MaybeHandle<String> Intl::NumberToLocaleString(Isolate* isolate,
   // 2. Let numberFormat be ? Construct(%NumberFormat%, « locales, options »).
   ASSIGN_RETURN_ON_EXCEPTION(
       isolate, number_format,
-      New<JSNumberFormat>(isolate, constructor, locales, options, method),
+      New<JSNumberFormat>(isolate, constructor, locales, options, method_name),
       String);
 
   if (can_cache) {
@@ -1134,55 +1501,6 @@ MaybeHandle<String> Intl::NumberToLocaleString(Isolate* isolate,
                                        numeric_obj);
 }
 
-namespace {
-
-// ecma402/#sec-defaultnumberoption
-Maybe<int> DefaultNumberOption(Isolate* isolate, Handle<Object> value, int min,
-                               int max, int fallback, Handle<String> property) {
-  // 2. Else, return fallback.
-  if (value->IsUndefined()) return Just(fallback);
-
-  // 1. If value is not undefined, then
-  // a. Let value be ? ToNumber(value).
-  Handle<Object> value_num;
-  ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-      isolate, value_num, Object::ToNumber(isolate, value), Nothing<int>());
-  DCHECK(value_num->IsNumber());
-
-  // b. If value is NaN or less than minimum or greater than maximum, throw a
-  // RangeError exception.
-  if (value_num->IsNaN() || value_num->Number() < min ||
-      value_num->Number() > max) {
-    THROW_NEW_ERROR_RETURN_VALUE(
-        isolate,
-        NewRangeError(MessageTemplate::kPropertyValueOutOfRange, property),
-        Nothing<int>());
-  }
-
-  // The max and min arguments are integers and the above check makes
-  // sure that we are within the integer range making this double to
-  // int conversion safe.
-  //
-  // c. Return floor(value).
-  return Just(FastD2I(floor(value_num->Number())));
-}
-
-}  // namespace
-
-// ecma402/#sec-getnumberoption
-Maybe<int> Intl::GetNumberOption(Isolate* isolate, Handle<JSReceiver> options,
-                                 Handle<String> property, int min, int max,
-                                 int fallback) {
-  // 1. Let value be ? Get(options, property).
-  Handle<Object> value;
-  ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-      isolate, value, JSReceiver::GetProperty(isolate, options, property),
-      Nothing<int>());
-
-  // Return ? DefaultNumberOption(value, minimum, maximum, fallback).
-  return DefaultNumberOption(isolate, value, min, max, fallback, property);
-}
-
 Maybe<Intl::NumberFormatDigitOptions> Intl::SetNumberFormatDigitOptions(
     Isolate* isolate, Handle<JSReceiver> options, int mnfd_default,
     int mxfd_default, bool notation_is_compact) {
@@ -1192,8 +1510,8 @@ Maybe<Intl::NumberFormatDigitOptions> Intl::SetNumberFormatDigitOptions(
   // 5. Let mnid be ? GetNumberOption(options, "minimumIntegerDigits,", 1, 21,
   // 1).
   int mnid = 1;
-  if (!Intl::GetNumberOption(isolate, options,
-                             factory->minimumIntegerDigits_string(), 1, 21, 1)
+  if (!GetNumberOption(isolate, options, factory->minimumIntegerDigits_string(),
+                       1, 21, 1)
            .To(&mnid)) {
     return Nothing<NumberFormatDigitOptions>();
   }
@@ -1613,7 +1931,7 @@ MaybeHandle<JSArray> CreateArrayFromList(Isolate* isolate,
 // ECMA 402 9.2.9 SupportedLocales(availableLocales, requestedLocales, options)
 // https://tc39.github.io/ecma402/#sec-supportedlocales
 MaybeHandle<JSObject> SupportedLocales(
-    Isolate* isolate, const char* method,
+    Isolate* isolate, const char* method_name,
     const std::set<std::string>& available_locales,
     const std::vector<std::string>& requested_locales, Handle<Object> options) {
   std::vector<std::string> supported_locales;
@@ -1622,12 +1940,12 @@ MaybeHandle<JSObject> SupportedLocales(
   Handle<JSReceiver> options_obj;
   ASSIGN_RETURN_ON_EXCEPTION(
       isolate, options_obj,
-      Intl::CoerceOptionsToObject(isolate, options, method), JSObject);
+      CoerceOptionsToObject(isolate, options, method_name), JSObject);
 
   // 2. Let matcher be ? GetOption(options, "localeMatcher", "string",
   //       « "lookup", "best fit" », "best fit").
   Maybe<Intl::MatcherOption> maybe_locale_matcher =
-      Intl::GetLocaleMatcher(isolate, options_obj, method);
+      Intl::GetLocaleMatcher(isolate, options_obj, method_name);
   MAYBE_RETURN(maybe_locale_matcher, MaybeHandle<JSObject>());
   Intl::MatcherOption matcher = maybe_locale_matcher.FromJust();
 
@@ -1693,19 +2011,62 @@ MaybeHandle<JSArray> VectorToJSArray(Isolate* isolate,
   return factory->NewJSArrayWithElements(fixed_array);
 }
 
-MaybeHandle<JSArray> AvailableCurrencies(Isolate* isolate) {
-  UErrorCode status = U_ZERO_ERROR;
-  UEnumeration* ids =
-      ucurr_openISOCurrencies(UCURR_COMMON | UCURR_NON_DEPRECATED, &status);
-  const char* next = nullptr;
-  std::vector<std::string> array;
-  while (U_SUCCESS(status) &&
-         (next = uenum_next(ids, nullptr, &status)) != nullptr) {
-    array.push_back(next);
+namespace {
+
+class ResourceAvailableCurrencies {
+ public:
+  ResourceAvailableCurrencies() {
+    UErrorCode status = U_ZERO_ERROR;
+    UEnumeration* uenum =
+        ucurr_openISOCurrencies(UCURR_COMMON | UCURR_NON_DEPRECATED, &status);
+    DCHECK(U_SUCCESS(status));
+    const char* next = nullptr;
+    while (U_SUCCESS(status) &&
+           (next = uenum_next(uenum, nullptr, &status)) != nullptr) {
+      // Work around the issue that we do not support VEF currency code
+      // in DisplayNames by not reporting it.
+      if (strcmp(next, "VEF") == 0) continue;
+      AddIfAvailable(next);
+    }
+    // Work around the issue that we do support the following currency codes
+    // in DisplayNames but the ICU API is not reporting it.
+    AddIfAvailable("SVC");
+    AddIfAvailable("VES");
+    AddIfAvailable("XDR");
+    AddIfAvailable("XSU");
+    AddIfAvailable("ZWL");
+    std::sort(list_.begin(), list_.end());
+    uenum_close(uenum);
   }
-  std::sort(array.begin(), array.end());
-  uenum_close(ids);
-  return VectorToJSArray(isolate, array);
+
+  const std::vector<std::string>& Get() const { return list_; }
+
+  void AddIfAvailable(const char* currency) {
+    icu::UnicodeString code(currency, -1, US_INV);
+    UErrorCode status = U_ZERO_ERROR;
+    int32_t len = 0;
+    const UChar* result =
+        ucurr_getName(code.getTerminatedBuffer(), "en", UCURR_LONG_NAME,
+                      nullptr, &len, &status);
+    if (U_SUCCESS(status) &&
+        u_strcmp(result, code.getTerminatedBuffer()) != 0) {
+      list_.push_back(currency);
+    }
+  }
+
+ private:
+  std::vector<std::string> list_;
+};
+
+const std::vector<std::string>& GetAvailableCurrencies() {
+  static base::LazyInstance<ResourceAvailableCurrencies>::type
+      available_currencies = LAZY_INSTANCE_INITIALIZER;
+  return available_currencies.Pointer()->Get();
+}
+}  // namespace
+
+MaybeHandle<JSArray> AvailableCurrencies(Isolate* isolate) {
+  return VectorToJSArray(isolate, GetAvailableCurrencies());
 }
 
 MaybeHandle<JSArray> AvailableNumberingSystems(Isolate* isolate) {
@@ -1807,7 +2168,7 @@ MaybeHandle<JSArray> Intl::SupportedValuesOf(Isolate* isolate,
 
 // ECMA 402 Intl.*.supportedLocalesOf
 MaybeHandle<JSObject> Intl::SupportedLocalesOf(
-    Isolate* isolate, const char* method,
+    Isolate* isolate, const char* method_name,
     const std::set<std::string>& available_locales, Handle<Object> locales,
     Handle<Object> options) {
   // Let availableLocales be %Collator%.[[AvailableLocales]].
@@ -1818,7 +2179,7 @@ MaybeHandle<JSObject> Intl::SupportedLocalesOf(
   MAYBE_RETURN(requested_locales, MaybeHandle<JSObject>());
 
   // Return ? SupportedLocales(availableLocales, requestedLocales, options).
-  return SupportedLocales(isolate, method, available_locales,
+  return SupportedLocales(isolate, method_name, available_locales,
                           requested_locales.FromJust(), options);
 }
 
@@ -1878,7 +2239,8 @@ bool Intl::IsValidNumberingSystem(const std::string& value) {
   UErrorCode status = U_ZERO_ERROR;
   std::unique_ptr<icu::NumberingSystem> numbering_system(
       icu::NumberingSystem::createInstanceByName(value.c_str(), status));
-  return U_SUCCESS(status) && numbering_system.get() != nullptr;
+  return U_SUCCESS(status) && numbering_system.get() != nullptr &&
+         !numbering_system->isAlgorithmic();
 }
 
 namespace {
@@ -2229,20 +2591,20 @@ base::TimezoneCache* Intl::CreateTimeZoneCache() {
 
 Maybe<Intl::MatcherOption> Intl::GetLocaleMatcher(Isolate* isolate,
                                                   Handle<JSReceiver> options,
-                                                  const char* method) {
-  return Intl::GetStringOption<Intl::MatcherOption>(
-      isolate, options, "localeMatcher", method, {"best fit", "lookup"},
+                                                  const char* method_name) {
+  return GetStringOption<Intl::MatcherOption>(
+      isolate, options, "localeMatcher", method_name, {"best fit", "lookup"},
       {Intl::MatcherOption::kBestFit, Intl::MatcherOption::kLookup},
       Intl::MatcherOption::kBestFit);
 }
 
 Maybe<bool> Intl::GetNumberingSystem(Isolate* isolate,
                                      Handle<JSReceiver> options,
-                                     const char* method,
+                                     const char* method_name,
                                      std::unique_ptr<char[]>* result) {
   const std::vector<const char*> empty_values = {};
-  Maybe<bool> maybe = Intl::GetStringOption(isolate, options, "numberingSystem",
-                                            empty_values, method, result);
+  Maybe<bool> maybe = GetStringOption(isolate, options, "numberingSystem",
+                                      empty_values, method_name, result);
   MAYBE_RETURN(maybe, Nothing<bool>());
   if (maybe.FromJust() && *result != nullptr) {
     if (!IsWellFormedNumberingSystem(result->get())) {
@@ -2349,41 +2711,6 @@ MaybeHandle<String> Intl::FormattedToString(
     THROW_NEW_ERROR(isolate, NewTypeError(MessageTemplate::kIcuError), String);
   }
   return Intl::ToString(isolate, result);
-}
-
-// ecma402/#sec-getoptionsobject
-MaybeHandle<JSReceiver> Intl::GetOptionsObject(Isolate* isolate,
-                                               Handle<Object> options,
-                                               const char* service) {
-  // 1. If options is undefined, then
-  if (options->IsUndefined(isolate)) {
-    // a. Return ! ObjectCreate(null).
-    return isolate->factory()->NewJSObjectWithNullProto();
-  }
-  // 2. If Type(options) is Object, then
-  if (options->IsJSReceiver()) {
-    // a. Return options.
-    return Handle<JSReceiver>::cast(options);
-  }
-  // 3. Throw a TypeError exception.
-  THROW_NEW_ERROR(isolate, NewTypeError(MessageTemplate::kInvalidArgument),
-                  JSReceiver);
-}
-
-// ecma402/#sec-coerceoptionstoobject
-MaybeHandle<JSReceiver> Intl::CoerceOptionsToObject(Isolate* isolate,
-                                                    Handle<Object> options,
-                                                    const char* service) {
-  // 1. If options is undefined, then
-  if (options->IsUndefined(isolate)) {
-    // a. Return ! ObjectCreate(null).
-    return isolate->factory()->NewJSObjectWithNullProto();
-  }
-  // 2. Return ? ToObject(options).
-  ASSIGN_RETURN_ON_EXCEPTION(isolate, options,
-                             Object::ToObject(isolate, options, service),
-                             JSReceiver);
-  return Handle<JSReceiver>::cast(options);
 }
 
 MaybeHandle<JSArray> Intl::ToJSArray(

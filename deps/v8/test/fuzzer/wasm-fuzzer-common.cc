@@ -122,7 +122,6 @@ void InterpretAndExecuteModule(i::Isolate* isolate,
   int32_t result_ref = 0;
   int32_t result = 0;
 
-  auto interpreter_result = testing::WasmInterpretationResult::Failed();
   if (module_ref.is_null()) {
     base::OwnedVector<WasmValue> arguments =
         testing::MakeDefaultInterpreterArguments(isolate, main_function->sig());
@@ -183,7 +182,7 @@ void InterpretAndExecuteModule(i::Isolate* isolate,
 
   if (exception_ref != exception) {
     const char* exception_text[] = {"no exception", "exception"};
-    FATAL("expected: %s; got: %s", exception_text[interpreter_result.trapped()],
+    FATAL("expected: %s; got: %s", exception_text[exception_ref],
           exception_text[exception]);
   }
 
@@ -205,6 +204,10 @@ PrintSig PrintReturns(const FunctionSig* sig) {
 }
 std::string ValueTypeToConstantName(ValueType type) {
   switch (type.kind()) {
+    case kI8:
+      return "kWasmI8";
+    case kI16:
+      return "kWasmI16";
     case kI32:
       return "kWasmI32";
     case kI64:
@@ -294,7 +297,6 @@ std::ostream& operator<<(std::ostream& os, WasmElemSegment::Entry entry) {
 
 // Appends an initializer expression encoded in {wire_bytes}, in the offset
 // contained in {expr}.
-// TODO(7748): Find a way to implement other expressions here.
 void AppendInitExpr(std::ostream& os, ModuleWireBytes wire_bytes,
                     WireBytesRef expr) {
   Decoder decoder(wire_bytes.module_bytes());
@@ -625,11 +627,14 @@ void WasmExecutionFuzzer::FuzzWasmModule(base::Vector<const uint8_t> data,
     GenerateTestCase(i_isolate, wire_bytes, compiles);
   }
 
-  bool validates =
-      GetWasmEngine()->SyncValidate(i_isolate, enabled_features, wire_bytes);
+  ModuleResult result = GetWasmEngine()->SyncValidateResult(
+      i_isolate, enabled_features, wire_bytes);
 
-  CHECK_EQ(compiles, validates);
-  CHECK_IMPLIES(require_valid, validates);
+  CHECK_EQ(compiles, result.ok());
+  CHECK_WITH_MSG(
+      !require_valid || result.ok(),
+      ("Generated module should validate, but got: " + result.error().message())
+          .c_str());
 
   if (!compiles) return;
 

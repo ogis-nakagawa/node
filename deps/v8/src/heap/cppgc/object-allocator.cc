@@ -59,9 +59,11 @@ void AddToFreeList(NormalPageSpace& space, Address start, size_t size) {
   // No need for SetMemoryInaccessible() as LAB memory is retrieved as free
   // inaccessible memory.
   space.free_list().Add({start, size});
+  // Concurrent marking may be running while the LAB is set up next to a live
+  // object sharing the same cell in the bitmap.
   NormalPage::From(BasePage::FromPayload(start))
       ->object_start_bitmap()
-      .SetBit(start);
+      .SetBit<AccessMode::kAtomic>(start);
 }
 
 void ReplaceLinearAllocationBuffer(NormalPageSpace& space,
@@ -78,7 +80,9 @@ void ReplaceLinearAllocationBuffer(NormalPageSpace& space,
     DCHECK_NOT_NULL(new_buffer);
     stats_collector.NotifyAllocation(new_size);
     auto* page = NormalPage::From(BasePage::FromPayload(new_buffer));
-    page->object_start_bitmap().ClearBit(new_buffer);
+    // Concurrent marking may be running while the LAB is set up next to a live
+    // object sharing the same cell in the bitmap.
+    page->object_start_bitmap().ClearBit<AccessMode::kAtomic>(new_buffer);
     MarkRangeAsYoung(page, new_buffer, new_buffer + new_size);
   }
 }
@@ -114,7 +118,6 @@ void* ObjectAllocator::OutOfLineAllocate(NormalPageSpace& space, size_t size,
                                          GCInfoIndex gcinfo) {
   void* memory = OutOfLineAllocateImpl(space, size, gcinfo);
   stats_collector_.NotifySafePointForConservativeCollection();
-  raw_heap_.heap()->AdvanceIncrementalGarbageCollectionOnAllocationIfNeeded();
   if (prefinalizer_handler_.IsInvokingPreFinalizers()) {
     // Objects allocated during pre finalizers should be allocated as black
     // since marking is already done. Atomics are not needed because there is

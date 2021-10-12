@@ -9,6 +9,7 @@
 #ifndef V8_WASM_WASM_MODULE_H_
 #define V8_WASM_WASM_MODULE_H_
 
+#include <map>
 #include <memory>
 
 #include "src/base/optional.h"
@@ -62,6 +63,10 @@ struct WasmFunction {
   uint32_t func_index;     // index into the function table.
   uint32_t sig_index;      // index into the signature table.
   WireBytesRef code;       // code of this function.
+  // Required number of slots in a feedback vector. Marked {mutable} because
+  // this is computed late (by Liftoff compilation), when the rest of the
+  // {WasmFunction} is typically considered {const}.
+  mutable int feedback_slots;
   bool imported;
   bool exported;
   bool declared;
@@ -257,7 +262,18 @@ struct V8_EXPORT_PRIVATE WasmDebugSymbols {
   WireBytesRef external_url;
 };
 
+struct TypeFeedbackStorage {
+  std::map<uint32_t, std::vector<int>> feedback_for_function;
+  // Accesses to {feedback_for_function} are guarded by this mutex.
+  base::Mutex mutex;
+};
+
 struct WasmTable;
+
+// End of a chain of explicit supertypes.
+constexpr uint32_t kGenericSuperType = 0xFFFFFFFE;
+// Used for types that have no explicit supertype.
+constexpr uint32_t kNoSuperType = 0xFFFFFFFF;
 
 // Static representation of a module.
 struct V8_EXPORT_PRIVATE WasmModule {
@@ -288,6 +304,7 @@ struct V8_EXPORT_PRIVATE WasmModule {
   WireBytesRef name = {0, 0};
   std::vector<TypeDefinition> types;  // by type index
   std::vector<uint8_t> type_kinds;    // by type index
+  std::vector<uint32_t> supertypes;   // by type index
   // Map from each type index to the index of its corresponding canonical type.
   // Note: right now, only functions are canonicalized, and arrays and structs
   // map to themselves.
@@ -295,9 +312,10 @@ struct V8_EXPORT_PRIVATE WasmModule {
 
   bool has_type(uint32_t index) const { return index < types.size(); }
 
-  void add_signature(const FunctionSig* sig) {
+  void add_signature(const FunctionSig* sig, uint32_t supertype) {
     types.push_back(TypeDefinition(sig));
     type_kinds.push_back(kWasmFunctionTypeCode);
+    supertypes.push_back(supertype);
     uint32_t canonical_id = sig ? signature_map.FindOrInsert(*sig) : 0;
     canonicalized_type_ids.push_back(canonical_id);
   }
@@ -309,9 +327,10 @@ struct V8_EXPORT_PRIVATE WasmModule {
     return types[index].function_sig;
   }
 
-  void add_struct_type(const StructType* type) {
+  void add_struct_type(const StructType* type, uint32_t supertype) {
     types.push_back(TypeDefinition(type));
     type_kinds.push_back(kWasmStructTypeCode);
+    supertypes.push_back(supertype);
     // No canonicalization for structs.
     canonicalized_type_ids.push_back(0);
   }
@@ -323,9 +342,10 @@ struct V8_EXPORT_PRIVATE WasmModule {
     return types[index].struct_type;
   }
 
-  void add_array_type(const ArrayType* type) {
+  void add_array_type(const ArrayType* type, uint32_t supertype) {
     types.push_back(TypeDefinition(type));
     type_kinds.push_back(kWasmArrayTypeCode);
+    supertypes.push_back(supertype);
     // No canonicalization for arrays.
     canonicalized_type_ids.push_back(0);
   }
@@ -335,6 +355,14 @@ struct V8_EXPORT_PRIVATE WasmModule {
   const ArrayType* array_type(uint32_t index) const {
     DCHECK(has_array(index));
     return types[index].array_type;
+  }
+
+  uint32_t supertype(uint32_t index) const {
+    DCHECK(index < supertypes.size());
+    return supertypes[index];
+  }
+  bool has_supertype(uint32_t index) const {
+    return supertype(index) != kNoSuperType;
   }
 
   std::vector<WasmFunction> functions;
@@ -347,6 +375,9 @@ struct V8_EXPORT_PRIVATE WasmModule {
   std::vector<WasmCompilationHint> compilation_hints;
   BranchHintInfo branch_hints;
   SignatureMap signature_map;  // canonicalizing map for signature indexes.
+  // Entries in this storage are short-lived: when tier-up of a function is
+  // scheduled, an entry is placed; the Turbofan graph builder consumes it.
+  mutable TypeFeedbackStorage type_feedback;
 
   ModuleOrigin origin = kWasmOrigin;  // origin of the module
   LazilyGeneratedNames lazily_generated_names;
@@ -418,6 +449,12 @@ int GetContainingWasmFunction(const WasmModule* module, uint32_t byte_offset);
 // contained within a function.
 int GetNearestWasmFunction(const WasmModule* module, uint32_t byte_offset);
 
+// Gets the explicitly defined subtyping depth for the given type.
+// Returns 0 if the type has no explicit supertype.
+// The result is capped to {kV8MaxRttSubtypingDepth + 1}.
+// Invalid cyclic hierarchies will return -1.
+int GetSubtypingDepth(const WasmModule* module, uint32_t type_index);
+
 // Interface to the storage (wire bytes) of a wasm module.
 // It is illegal for anyone receiving a ModuleWireBytes to store pointers based
 // on module_bytes, as this storage is only guaranteed to be alive as long as
@@ -477,7 +514,8 @@ Handle<JSObject> GetTypeForFunction(Isolate* isolate, const FunctionSig* sig,
 Handle<JSObject> GetTypeForGlobal(Isolate* isolate, bool is_mutable,
                                   ValueType type);
 Handle<JSObject> GetTypeForMemory(Isolate* isolate, uint32_t min_size,
-                                  base::Optional<uint32_t> max_size);
+                                  base::Optional<uint32_t> max_size,
+                                  bool shared);
 Handle<JSObject> GetTypeForTable(Isolate* isolate, ValueType type,
                                  uint32_t min_size,
                                  base::Optional<uint32_t> max_size);

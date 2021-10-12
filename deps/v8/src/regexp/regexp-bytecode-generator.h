@@ -27,7 +27,7 @@ class V8_EXPORT_PRIVATE RegExpBytecodeGenerator : public RegExpMacroAssembler {
   ~RegExpBytecodeGenerator() override;
   // The byte-code interpreter checks on each push anyway.
   int stack_limit_slack() override { return 1; }
-  bool CanReadUnaligned() override { return false; }
+  bool CanReadUnaligned() const override { return false; }
   void Bind(Label* label) override;
   void AdvanceCurrentPosition(int by) override;  // Signed cp change.
   void PopCurrentPosition() override;
@@ -83,7 +83,8 @@ class V8_EXPORT_PRIVATE RegExpBytecodeGenerator : public RegExpMacroAssembler {
   Handle<HeapObject> GetCode(Handle<String> source) override;
 
  private:
-  void Expand();
+  void ExpandBuffer();
+
   // Code and bitmap emission.
   inline void EmitOrLink(Label* label);
   inline void Emit32(uint32_t x);
@@ -96,7 +97,9 @@ class V8_EXPORT_PRIVATE RegExpBytecodeGenerator : public RegExpMacroAssembler {
   void Copy(byte* a);
 
   // The buffer into which code and relocation info are generated.
-  base::Vector<byte> buffer_;
+  static constexpr int kInitialBufferSize = 1024;
+  ZoneVector<byte> buffer_;
+
   // The program counter.
   int pc_;
   Label backtrack_;

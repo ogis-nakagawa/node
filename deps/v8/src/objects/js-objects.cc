@@ -58,6 +58,7 @@
 #include "src/objects/js-segmenter.h"
 #include "src/objects/js-segments.h"
 #endif  // V8_INTL_SUPPORT
+#include "src/objects/js-temporal-objects-inl.h"
 #include "src/objects/js-weak-refs.h"
 #include "src/objects/map-inl.h"
 #include "src/objects/module.h"
@@ -260,7 +261,7 @@ V8_WARN_UNUSED_RESULT Maybe<bool> FastAssign(
         PropertyDetails details = descriptors->GetDetails(i);
         if (!details.IsEnumerable()) continue;
         if (details.kind() == kData) {
-          if (details.location() == kDescriptor) {
+          if (details.location() == PropertyLocation::kDescriptor) {
             prop_value = handle(descriptors->GetStrongValue(i), isolate);
           } else {
             Representation representation = details.representation();
@@ -1054,6 +1055,11 @@ Maybe<bool> JSReceiver::DefineOwnProperty(Isolate* isolate,
   if (object->IsJSTypedArray()) {
     return JSTypedArray::DefineOwnProperty(
         isolate, Handle<JSTypedArray>::cast(object), key, desc, should_throw);
+  }
+  if (object->IsJSModuleNamespace()) {
+    return JSModuleNamespace::DefineOwnProperty(
+        isolate, Handle<JSModuleNamespace>::cast(object), key, desc,
+        should_throw);
   }
 
   // OrdinaryDefineOwnProperty, by virtue of calling
@@ -1996,7 +2002,7 @@ V8_WARN_UNUSED_RESULT Maybe<bool> FastGetOwnValuesOrEntries(
       PropertyDetails details = descriptors->GetDetails(index);
       if (!details.IsEnumerable()) continue;
       if (details.kind() == kData) {
-        if (details.location() == kDescriptor) {
+        if (details.location() == PropertyLocation::kDescriptor) {
           prop_value = handle(descriptors->GetStrongValue(index), isolate);
         } else {
           Representation representation = details.representation();
@@ -2238,6 +2244,7 @@ int JSObject::GetHeaderSize(InstanceType type,
     case JS_BOUND_FUNCTION_TYPE:
       return JSBoundFunction::kHeaderSize;
     case JS_FUNCTION_TYPE:
+    case JS_CLASS_CONSTRUCTOR_TYPE:
     case JS_PROMISE_CONSTRUCTOR_TYPE:
     case JS_REG_EXP_CONSTRUCTOR_TYPE:
     case JS_ARRAY_CONSTRUCTOR_TYPE:
@@ -2297,6 +2304,26 @@ int JSObject::GetHeaderSize(InstanceType type,
       return JSStringIterator::kHeaderSize;
     case JS_MODULE_NAMESPACE_TYPE:
       return JSModuleNamespace::kHeaderSize;
+    case JS_TEMPORAL_CALENDAR_TYPE:
+      return JSTemporalCalendar::kHeaderSize;
+    case JS_TEMPORAL_DURATION_TYPE:
+      return JSTemporalDuration::kHeaderSize;
+    case JS_TEMPORAL_INSTANT_TYPE:
+      return JSTemporalInstant::kHeaderSize;
+    case JS_TEMPORAL_PLAIN_DATE_TYPE:
+      return JSTemporalPlainDate::kHeaderSize;
+    case JS_TEMPORAL_PLAIN_DATE_TIME_TYPE:
+      return JSTemporalPlainDateTime::kHeaderSize;
+    case JS_TEMPORAL_PLAIN_MONTH_DAY_TYPE:
+      return JSTemporalPlainMonthDay::kHeaderSize;
+    case JS_TEMPORAL_PLAIN_TIME_TYPE:
+      return JSTemporalPlainTime::kHeaderSize;
+    case JS_TEMPORAL_PLAIN_YEAR_MONTH_TYPE:
+      return JSTemporalPlainYearMonth::kHeaderSize;
+    case JS_TEMPORAL_TIME_ZONE_TYPE:
+      return JSTemporalTimeZone::kHeaderSize;
+    case JS_TEMPORAL_ZONED_DATE_TIME_TYPE:
+      return JSTemporalZonedDateTime::kHeaderSize;
 #ifdef V8_INTL_SUPPORT
     case JS_V8_BREAK_ITERATOR_TYPE:
       return JSV8BreakIterator::kHeaderSize;
@@ -2584,6 +2611,7 @@ void JSObject::JSObjectShortPrint(StringStream* accumulator) {
   case TYPE##_TYPED_ARRAY_CONSTRUCTOR_TYPE:
       TYPED_ARRAYS(TYPED_ARRAY_CONSTRUCTORS_SWITCH)
 #undef TYPED_ARRAY_CONSTRUCTORS_SWITCH
+    case JS_CLASS_CONSTRUCTOR_TYPE:
     case JS_FUNCTION_TYPE: {
       JSFunction function = JSFunction::cast(*this);
       std::unique_ptr<char[]> fun_name = function.shared().DebugNameCStr();
@@ -2710,8 +2738,8 @@ void JSObject::PrintInstanceMigration(FILE* file, Map original_map,
     if (!o_r.Equals(n_r)) {
       String::cast(o.GetKey(i)).PrintOn(file);
       PrintF(file, ":%s->%s ", o_r.Mnemonic(), n_r.Mnemonic());
-    } else if (o.GetDetails(i).location() == kDescriptor &&
-               n.GetDetails(i).location() == kField) {
+    } else if (o.GetDetails(i).location() == PropertyLocation::kDescriptor &&
+               n.GetDetails(i).location() == PropertyLocation::kField) {
       Name name = o.GetKey(i);
       if (name.IsString()) {
         String::cast(name).PrintOn(file);
@@ -2817,7 +2845,7 @@ void MigrateFastToFast(Isolate* isolate, Handle<JSObject> object,
 
     // If the map adds a new kDescriptor property, simply set the map.
     PropertyDetails details = new_map->GetLastDescriptorDetails(isolate);
-    if (details.location() == kDescriptor) {
+    if (details.location() == PropertyLocation::kDescriptor) {
       object->set_map(*new_map, kReleaseStore);
       return;
     }
@@ -2852,7 +2880,7 @@ void MigrateFastToFast(Isolate* isolate, Handle<JSObject> object,
     } else {
       value = isolate->factory()->uninitialized_value();
     }
-    DCHECK_EQ(kField, details.location());
+    DCHECK_EQ(PropertyLocation::kField, details.location());
     DCHECK_EQ(kData, details.kind());
     DCHECK(!index.is_inobject());  // Must be a backing store index.
     new_storage->set(index.outobject_array_index(), *value);
@@ -2902,13 +2930,13 @@ void MigrateFastToFast(Isolate* isolate, Handle<JSObject> object,
 
   for (InternalIndex i : InternalIndex::Range(old_nof)) {
     PropertyDetails details = new_descriptors->GetDetails(i);
-    if (details.location() != kField) continue;
+    if (details.location() != PropertyLocation::kField) continue;
     DCHECK_EQ(kData, details.kind());
     PropertyDetails old_details = old_descriptors->GetDetails(i);
     Representation old_representation = old_details.representation();
     Representation representation = details.representation();
     Handle<Object> value;
-    if (old_details.location() == kDescriptor) {
+    if (old_details.location() == PropertyLocation::kDescriptor) {
       if (old_details.kind() == kAccessor) {
         // In case of kAccessor -> kData property reconfiguration, the property
         // must already be prepared for data of certain type.
@@ -2924,7 +2952,7 @@ void MigrateFastToFast(Isolate* isolate, Handle<JSObject> object,
         DCHECK(!old_representation.IsDouble() && !representation.IsDouble());
       }
     } else {
-      DCHECK_EQ(kField, old_details.location());
+      DCHECK_EQ(PropertyLocation::kField, old_details.location());
       FieldIndex index = FieldIndex::ForDescriptor(isolate, *old_map, i);
       value = handle(object->RawFastPropertyAt(isolate, index), isolate);
       if (!old_representation.IsDouble() && representation.IsDouble()) {
@@ -2946,7 +2974,7 @@ void MigrateFastToFast(Isolate* isolate, Handle<JSObject> object,
 
   for (InternalIndex i : InternalIndex::Range(old_nof, new_nof)) {
     PropertyDetails details = new_descriptors->GetDetails(i);
-    if (details.location() != kField) continue;
+    if (details.location() != PropertyLocation::kField) continue;
     DCHECK_EQ(kData, details.kind());
     Handle<Object> value;
     if (details.representation().IsDouble()) {
@@ -3035,7 +3063,7 @@ void MigrateFastToSlow(Isolate* isolate, Handle<JSObject> object,
     PropertyDetails details = descs->GetDetails(i);
     Handle<Name> key(descs->GetKey(isolate, i), isolate);
     Handle<Object> value;
-    if (details.location() == kField) {
+    if (details.location() == PropertyLocation::kField) {
       FieldIndex index = FieldIndex::ForDescriptor(isolate, *map, i);
       if (details.kind() == kData) {
         value = handle(object->RawFastPropertyAt(isolate, index), isolate);
@@ -3050,7 +3078,7 @@ void MigrateFastToSlow(Isolate* isolate, Handle<JSObject> object,
       }
 
     } else {
-      DCHECK_EQ(kDescriptor, details.location());
+      DCHECK_EQ(PropertyLocation::kDescriptor, details.location());
       value = handle(descs->GetStrongValue(isolate, i), isolate);
     }
     DCHECK(!value.is_null());
@@ -3592,7 +3620,7 @@ void JSObject::MigrateSlowToFast(Handle<JSObject> object,
       new_map->set_may_have_interesting_symbols(true);
     }
 
-    DCHECK_EQ(kField, details.location());
+    DCHECK_EQ(PropertyLocation::kField, details.location());
     DCHECK_IMPLIES(!V8_DICT_PROPERTY_CONST_TRACKING_BOOL,
                    details.constness() == PropertyConstness::kMutable);
 
@@ -3617,7 +3645,7 @@ void JSObject::MigrateSlowToFast(Handle<JSObject> object,
                                        details.attributes());
     }
     details = d.GetDetails();
-    if (details.location() == kField) {
+    if (details.location() == PropertyLocation::kField) {
       if (current_offset < inobject_props) {
         object->InObjectPropertyAtPut(current_offset, value,
                                       UPDATE_WRITE_BARRIER);
@@ -4417,7 +4445,7 @@ Object JSObject::SlowReverseLookup(Object value) {
     bool value_is_number = value.IsNumber();
     for (InternalIndex i : map().IterateOwnDescriptors()) {
       PropertyDetails details = descs.GetDetails(i);
-      if (details.location() == kField) {
+      if (details.location() == PropertyLocation::kField) {
         DCHECK_EQ(kData, details.kind());
         FieldIndex field_index = FieldIndex::ForDescriptor(map(), i);
         Object property = RawFastPropertyAt(field_index);
@@ -4430,7 +4458,7 @@ Object JSObject::SlowReverseLookup(Object value) {
           return descs.GetKey(i);
         }
       } else {
-        DCHECK_EQ(kDescriptor, details.location());
+        DCHECK_EQ(PropertyLocation::kDescriptor, details.location());
         if (details.kind() == kData) {
           if (descs.GetStrongValue(i) == value) {
             return descs.GetKey(i);

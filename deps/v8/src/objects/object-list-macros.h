@@ -158,6 +158,16 @@ class ZoneForwardList;
   V(JSSetIterator)                             \
   V(JSSpecialObject)                           \
   V(JSStringIterator)                          \
+  V(JSTemporalCalendar)                        \
+  V(JSTemporalDuration)                        \
+  V(JSTemporalInstant)                         \
+  V(JSTemporalPlainDate)                       \
+  V(JSTemporalPlainTime)                       \
+  V(JSTemporalPlainDateTime)                   \
+  V(JSTemporalPlainMonthDay)                   \
+  V(JSTemporalPlainYearMonth)                  \
+  V(JSTemporalTimeZone)                        \
+  V(JSTemporalZonedDateTime)                   \
   V(JSTypedArray)                              \
   V(JSWeakCollection)                          \
   V(JSWeakRef)                                 \
@@ -270,6 +280,7 @@ class ZoneForwardList;
   V(FreeSpaceOrFiller)                       \
   V(FunctionContext)                         \
   V(JSApiObject)                             \
+  V(JSClassConstructor)                      \
   V(JSLastDummyApiObject)                    \
   V(JSPromiseConstructor)                    \
   V(JSArrayConstructor)                      \
